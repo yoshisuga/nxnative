@@ -188,26 +188,21 @@ static void read_layout(module_t *m, const char *dir) {
     FILE *f = fopen(path, "r");
     if (!f) die("open %s", path);
     static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
-    char line[256], key[48]; unsigned long v; unsigned seen = 0;
+    char line[256], key[32]; unsigned long v; unsigned seen = 0;
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "# %47s %lx", key, &v) != 2) die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
+        if (sscanf(line, "# %31s %lx", key, &v) != 2) die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
         if (!strcmp(key, "PATCH_OFF")) m->patch_off = strtoll(line + 2 + strlen(key), NULL, 16);   // may be negative (patch area before the base)
         else if (!strcmp(key, "IMAGE_SIZE")) m->image_size = v;
         else if (!strcmp(key, "FILE_IMAGE_LEN")) m->file_image_len = v;
-        else if (!strcmp(key, "BACK_OFF")) m->back_off = v;
-        else if (!strcmp(key, "BACK_LEN")) m->back_len = v;
+        else if (!strcmp(key, "PATCH_LEN")) m->patch_len = v;   // with a back patch area: the front one's padded length in the file
+        else if (!strcmp(key, "PATCH2_OFF")) m->patch2_off = v;
+        else if (!strcmp(key, "PATCH2_LEN")) m->patch2_len = v;
         else if (!strcmp(key, "KEY_PAGE_OFF")) m->key_page_off = v;
         else if (!strcmp(key, "KEY_PAGE_SIZE")) m->key_page_size = v;
         else if (!strcmp(key, "TEXT_END")) m->text_end = v;
         else if (!strcmp(key, "RO_OFF")) m->ro_off = v;
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
-        else if (!strcmp(key, "UE_MALLOC_VT")) m->ue_malloc_vt = v;
-        else if (!strcmp(key, "UE_MALLOC_SLOT")) m->ue_malloc_slot = (unsigned)v;
-        else if (!strncmp(key, "UE_CVAR:", 8)) {
-            if (m->n_ue_cvar == (int)(sizeof m->ue_cvar / sizeof *m->ue_cvar) || strlen(key + 8) >= sizeof m->ue_cvar[0].name) die("%s: too many Unreal console variables, or too long a name: %s", path, key);
-            strcpy(m->ue_cvar[m->n_ue_cvar].name, key + 8); m->ue_cvar[m->n_ue_cvar++].off = v;
-        }
         else if (!strcmp(key, "BUILD_ID")) sscanf(line, "# %*s %32s", m->build_id);
         else for (int k = 0; k < KEY_N; k++) {
             size_t n = strlen(kn[k]);
@@ -221,9 +216,8 @@ static void read_layout(module_t *m, const char *dir) {
         die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))
         die("%s: patch area before the base, but IMAGE_SIZE / FILE_IMAGE_LEN missing or wrong", path);
-    if ((m->back_off || m->back_len) && (m->patch_off >= 0 || !m->back_len || m->back_off % 0x4000 || m->back_len % 0x4000 || m->back_off < m->key_page_off + m->key_page_size
-                                         || m->back_off + m->back_len != m->image_size))
-        die("%s: back patch area, but BACK_OFF / BACK_LEN missing or wrong", path);
+    if (m->patch2_off && (m->patch_off >= 0 || !m->patch_len || m->patch_len % 0x4000 || m->patch2_off % 0x4000 || m->patch2_len % 0x4000 || m->patch2_off < m->key_page_off + m->key_page_size || m->patch2_off + m->patch2_len > m->image_size))
+        die("%s: a back patch area (PATCH2_OFF), but the layout is wrong", path);
 }
 
 // Frame step state (the page after the key page, read-write; layout in patch_nso.py FRAME_STEP): the rewriter's stubs step the game by the host's whole vsyncs capped at this
@@ -239,7 +233,7 @@ static void install_fps_state(module_t *m) {
 // DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs
 void dm_fps_state_apply(void) {
     if (!dm_fps_state) return;
-    const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
+    const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : dm_profile()->fps_target;
     if (t != 0 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; using the game's own frame step", e); t = 0; }
     float f = (float)t; memcpy(dm_fps_state, &f, sizeof f);
     // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880): 1.0 keeps the game's own size and dynamic resolution;
@@ -546,12 +540,10 @@ static void map_image(module_t *m, const char *dir) {
     if (m->nro) { if (!nro_pieces(m->name, &x0, &z0, &w, &zw, &x1, &z1)) die("NRO %s: not in the embedded NRO table (__DATA,__dm_nro_tab)", m->name); }
     else { x0 = getsectiondata(IMAGE_MH, "__TEXT", sx0, &z0); w = getsectiondata(IMAGE_MH, dm, "__img", &zw); x1 = getsectiondata(IMAGE_MH, "__TEXT", sx1, &z1); }
     if (!x0 || !w || !x1) die("embedded sections %s / %s / %s missing", sx0, dm, sx1);
-    // The back patch area (patch_nso.py TWO) is a fourth section, __dm<name>x2; NROs never have one (nro_pieces holds three pieces)
-    unsigned long z2 = 0; const uint8_t *x2 = NULL;
-    if (m->back_len) {
-        char sx2[17]; snprintf(sx2, sizeof sx2, "__dm%sx2", m->name);
-        if (m->nro || !(x2 = getsectiondata(IMAGE_MH, "__TEXT", sx2, &z2)) || z2 != m->back_len || ((uintptr_t)x2 & 0x3FFF)) die("embedded back patch area %s missing or wrong", sx2);
-    }
+    // The back patch area (patch2_off, patch_nso.py HUGE) is a fourth section, __TEXT,__dm<name>x2, remapped after the key page
+    const uint8_t *x2 = NULL; unsigned long z2 = 0; char sx2[17]; snprintf(sx2, sizeof sx2, "__dm%sx2", m->name);
+    if (m->patch2_off && (m->nro || !(x2 = getsectiondata(IMAGE_MH, "__TEXT", sx2, &z2)) || z2 != m->patch2_len || z1 != m->patch_len || ((uintptr_t)x2 & 0x3FFF)))
+        die("%s: embedded back patch area %s missing or of the wrong size", m->name, sx2);
     // Patch area before the base (patch_off < 0): W ends at the end of data (FILE_IMAGE_LEN); bss and the key page are zero pages from vm_allocate and are not in the executable
     int front = m->patch_off < 0;
     if (z0 + zw != (front ? m->file_image_len : (uint64_t)m->patch_off) || (z0 & 0x3FFF) || (zw & 0x3FFF) || (z1 & 0x3FFF) || ((uintptr_t)x0 & 0x3FFF) || ((uintptr_t)w & 0x3FFF) || ((uintptr_t)x1 & 0x3FFF))
@@ -567,7 +559,7 @@ static void map_image(module_t *m, const char *dir) {
     // A module with nothing to rewrite has an empty patch area (87 of Super Smash Bros. Ultimate's 98 NROs: no x18, SVC or TLS register use); vm_remap refuses 0 bytes
     // (KERN_INVALID_ARGUMENT), which stopped the app at launch on an iPhone at the first such NRO (found in PR #94)
     if (z1) remap_at(m, base + m->patch_off, x1, z1, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-    if (z2) remap_at(m, base + m->back_off, x2, z2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (z2) remap_at(m, base + m->patch2_off, x2, z2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     m->base = (uint8_t *)base; install_key_page(m);
 }
 #else
@@ -587,17 +579,23 @@ static void map_image(module_t *m, const char *dir) {
     size_t sz; uint8_t *raw = slurp(path, &sz);
     if (m->patch_off < 0) {
         // Patch area before the base: file = the first part of the image (text + ro + data) + patch area; bss and the key page are anonymous zero pages. The gap from the patch area's end to the base is left inaccessible (PROT_NONE)
-        // With a back patch area (patch_nso.py TWO) the file ends with it, BACK_LEN bytes, copied to BACK_OFF in the image
-        uint64_t pre = (uint64_t)-m->patch_off, fl = m->file_image_len, bl = m->back_len;
-        if (sz < fl + bl) die("%s is shorter than FILE_IMAGE_LEN %#llx + BACK_LEN %#llx", path, (unsigned long long)fl, (unsigned long long)bl);
-        m->size = m->image_size; m->patch_len = (sz - bl - fl + 0x3FFF) & ~0x3FFFull;
+        uint64_t pre = (uint64_t)-m->patch_off, fl = m->file_image_len;
+        if (sz < fl) die("%s is shorter than FILE_IMAGE_LEN %#llx", path, (unsigned long long)fl);
+        // A back patch area (patch2_off, patch_nso.py HUGE) follows the front one, which the header then sizes (PATCH_LEN), in the file and goes after the key page
+        uint64_t back = 0;
+        if (m->patch2_off) {
+            if (sz < fl + m->patch_len || sz - fl - m->patch_len > m->patch2_len) die("%s does not hold FILE_IMAGE_LEN + PATCH_LEN + a back patch area of at most PATCH2_LEN", path);
+            back = sz - fl - m->patch_len;
+        } else m->patch_len = (sz - fl + 0x3FFF) & ~0x3FFFull;
+        m->size = m->image_size;
         if (m->patch_len > pre) die("%s patch area of %#llx bytes does not fit in the %#llx before the base", path, (unsigned long long)m->patch_len, (unsigned long long)pre);
         uint8_t *a = mmap(NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
-        memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
+        memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl - back);
+        if (back) memcpy(m->base + m->patch2_off, raw + fl + m->patch_len, back);
         free(raw); install_key_page(m);
-        if (bl && mprotect(m->base + m->back_off, bl, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
+        if (m->patch2_len && mprotect(m->base + m->patch2_off, m->patch2_len, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
         if (mprotect(a, m->patch_len, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
@@ -615,11 +613,7 @@ static void map_image(module_t *m, const char *dir) {
 }
 #endif
 
-static char g_module_dir[1024];   // the folder the modules were loaded from (dm_module_dir)
-const char *dm_module_dir(void) { return g_module_dir; }
-
 void load_modules(const char *dir, const char **names, int n) {
-    strlcpy(g_module_dir, dir, sizeof g_module_dir);
     // Map everything and parse the symbol tables first, then relocate all at once (cross-module symbols must all be in place first)
     // DM_BOOTPROF: breakdown of ① host loading (milliseconds), to set the upper bound for ③ pre-relocation / mmap
     uint64_t t0 = now_ns(), tm = 0, tp = 0, tg = 0, tr = 0, t;

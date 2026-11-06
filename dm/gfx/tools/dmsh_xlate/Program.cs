@@ -25,9 +25,6 @@ static class SwshXlate
     // NVN's handle tables in c[2], byte offsets, 8 bytes per slot (one layout in every game, see dm/gfx/tools/dmsh_build.py): combined textures 0x20 + 8 r, images 0x120 + 8 r (8 slots),
     // separate textures 0x168 + 8 r (slot 128 + r), separate samplers 0x568 + 8 r
     const int TexBase = 0x20, ImgBase = 0x120, ImgSlots = 8, SepTexBase = 0x168, SepTexSlot0 = 128, SampBase = 0x568;
-    // Handle words in c[2]: one every 8 bytes up to the end of the separate sampler table (128 slots), 301 in all. An array of c[2] handles the shader indexes at run time (Ryujinx's
-    // texture array from a buffer, BindlessToArray: the index is the handle's byte offset ÷ 8) has one element per word, so any word the shader computes is in it
-    const int C2HandleWords = (SampBase + 8 * 128) / 8;
 
     sealed class Accessor : IGpuAccessor
     {
@@ -54,13 +51,9 @@ static class SwshXlate
         public SetBindingPair CreateStorageBufferBinding(int index) => new(0, _binding++);
         public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
-        // A texture read whose handle the translator cannot trace to one slot indexes the texture and sampler pools by the handle's IDs (20 and 12 bits); dmsh_build.py turns these
-        // arrays into pointers to the pools the replay keeps (pool_arrays), with a run-time bound, so the lengths are the whole ID ranges
-        public int QuerySamplerArrayLengthFromPool() => 1 << 12;
-        // c[2]: every handle word (C2HandleWords). EA SPORTS FC 27's lights index separate texture i as element 45 + i (c2 byte 0x168 + 8 i), which 32 elements clamped to element 31.
-        // Other buffers (the game's own uniform buffers, read through the handles' byte offsets as well) keep 32
-        public int QueryTextureArrayLengthFromBuffer(int slot) => slot == 2 ? C2HandleWords : 32;
-        public int QueryTextureArrayLengthFromPool() => 1 << 20;
+        public int QuerySamplerArrayLengthFromPool() => 32;
+        public int QueryTextureArrayLengthFromBuffer(int slot) => 32;
+        public int QueryTextureArrayLengthFromPool() => 32;
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
         // A handle's texture or image slot, numbered as dmsh_build.py decode_tex numbers the reflection's (so an answer table row names the slot the reflection shows): the handle ORs two
@@ -124,18 +117,13 @@ static class SwshXlate
             Array32<AttributeType> attr = default; Array8<AttributeType> fout = default;
             if (_job["attr"] is JsonObject a) foreach (var kv in a) attr[int.Parse(kv.Key)] = Attr((string)kv.Value);
             if (_job["fout"] is JsonObject f) foreach (var kv in f) fout[int.Parse(kv.Key)] = Attr((string)kv.Value);
-            bool earlyZ = _job["early_fragment_tests"] is JsonNode ez && (bool)ez;   // control +0x718 (dmsh_build.py job_for): [[early_fragment_tests]] in the MSL
-            return new GpuGraphicsState(earlyZ, _job["geometry_topology"] is JsonNode gt ? (InputTopology)(int)gt : InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
+            return new GpuGraphicsState(false, _job["geometry_topology"] is JsonNode gt ? (InputTopology)(int)gt : InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
                 false, false, false, false /* depth not rewritten: dmsh_build.py adds the GL entry point (see the file header) */, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
                 false /* no Y flip */, true /* origin upper-left */, false);
         }
         public bool QueryHostSupportsTextureShadowLod() => true;
         public bool QueryHostSupportsDepthClipControl() => false;   // Metal has no -1..1 clip control; the depth convention is not left to the translator, the rewrite is added per entry point in the MSL (see the file header)
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
-        // Profile key shader_sb_unaligned: storage offsets from the binding's base rounded down to 16 bytes, read from c0 at run time (GlobalToStorage), so a sub-word access keeps
-        // the address's low bits; the replay binds such buffers at that rounded base (nvn_mtl.m). Without it an offset counts from the exact base, which Metal cannot hold off a word
-        public bool QueryHasUnalignedStorageBuffer() => _job["sb_unaligned"] is JsonNode n && (bool)n;
-        public int QueryHostStorageBufferOffsetAlignment() => 16;
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
         // Job softfloat64 = true: the host has no FP64, so Ryujinx's DoubleToFloat pass lowers double operations to float (Metal has no double type). Set only on the retry of a
         // shader whose first translation declared a 64-bit float (see Main): answering "no" for every shader would also drop the Float64 capability from all the others

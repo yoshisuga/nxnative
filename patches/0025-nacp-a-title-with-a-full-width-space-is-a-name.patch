@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoshi Sugawara <yoshi.sugawara@gmail.com>
+Date: Wed, 28 Oct 2026 09:06:01 -1000
+Subject: [PATCH] nacp: a title with a full-width space is a name
+
+Japanese titles put U+3000 between words, which isprintable rejects, so the
+NSP script found no game name for DRAGON QUEST XI S (010054A0085CA000).
+Whitespace is normalised to a plain space first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: DRAGON QUEST XI S JP (010054A0085CA000) bring-up on iOS: see the commit message
+Issue: none yet (local bring-up of DRAGON QUEST XI S JP, 010054A0085CA000)
+
+---
+ dm/tools/nacp.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/dm/tools/nacp.py b/dm/tools/nacp.py
+index a912fb0..a75c24f 100644
+--- a/dm/tools/nacp.py
++++ b/dm/tools/nacp.py
+@@ -25,6 +25,7 @@ def name(path):
+         if not n: continue
+         try: n = n.decode('utf-8')
+         except UnicodeDecodeError: return ''
++        n = re.sub(r'\s', ' ', n)   # Japanese titles put a full-width space (U+3000) between words, which isprintable rejects (DRAGON QUEST XI S)
+         return n if n.isprintable() else ''
+     return ''
+ 

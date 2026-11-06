@@ -4,47 +4,48 @@
 // in UserDefaults; Reset to tested defaults shows the defaults, and Play then forgets them. DM_LAUNCHER=0 in Documents/env.txt starts the game at once with the saved choices; DM_SAVED_CHOICES=0 ignores them (and keeps them)
 import SwiftUI
 import UIKit
-import UniformTypeIdentifiers
 import os
 
 private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryKey: key) }
 
-
-/// Cloud saves: an iCloud Drive folder shared with the Mac app (chosen in its settings window's
-/// Cloud saves too). The host brings the save in from there when the game starts and
-/// sends it there after each save (dm/host/save_sync.h); the folder is a bookmark (CloudSaves.m).
-private struct CloudSavesSection: View {
-    @State private var folder: String = ""
+/// Where this game's data comes from, and a picker to change it.
+///
+/// The app can only read files it owns unless the player hands it a location through the document
+/// picker — so a game's RomFS kept on an external drive or in iCloud Drive could not be used at all
+/// before this. Picking an image (romfs.img) or a folder stores a bookmark (DataBookmark.m), and
+/// romfs_locate() prefers it from the next launch on.
+private struct GameDataSection: View {
+    @State private var picked: String = ""
     @State private var note: String = ""
     @State private var picking = false
 
     var body: some View {
         Section {
             HStack {
-                Text("Cloud saves")
+                Text("Game data")
                 Spacer()
-                Text(folder.isEmpty ? "Off" : (folder as NSString).lastPathComponent)
+                Text(picked.isEmpty ? "This app's folder" : (picked as NSString).lastPathComponent)
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
-            Button(folder.isEmpty ? "Choose a folder in iCloud Drive…" : "Choose a different folder…") { picking = true }
-            if !folder.isEmpty {
-                Button("Turn off cloud saves", role: .destructive) {
-                    dm_clear_cloud_saves(); refresh(); note = ""
+            Button(picked.isEmpty ? "Choose game data…" : "Choose a different location…") { picking = true }
+            if !picked.isEmpty {
+                Button("Use the app's own data again", role: .destructive) {
+                    dm_clear_picked_data(); refresh(); note = ""
                 }
             }
         } footer: {
             Text(note.isEmpty
-                 ? "Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups."
+                 ? "Pick the game's romfs.img or its RomFS folder — an external drive or iCloud Drive works. The app remembers the choice; a re-signed build asks once more."
                  : note)
         }
         .sheet(isPresented: $picking) {
-            DocumentPicker(types: [.folder]) { url in
+            DocumentPicker { url in
                 picking = false
-                if dm_store_cloud_saves(url) {
-                    note = "Saved. The game uses this folder when you press Play."
+                if dm_store_picked_data(url) {
+                    note = "Saved. The game uses this location when you press Play."
                     refresh()
                 } else {
-                    note = "That folder could not be remembered — try a different one."
+                    note = "That location could not be remembered — try a different one."
                 }
             } onCancel: { picking = false }
         }
@@ -52,23 +53,26 @@ private struct CloudSavesSection: View {
     }
 
     private func refresh() {
+        // ObjC BOOL* is ObjCBool, not Bool: the bookmark header takes an indirect flag for
+        // "the bookmark exists but does not resolve under this signature", which is the one
+        // state worth telling the player about.
         var stale: ObjCBool = false
-        folder = dm_cloud_saves_path(&stale) ?? ""
-        if stale.boolValue && folder.isEmpty {
-            note = "The folder you chose before is no longer readable (the app was signed differently). Please choose it again."
+        picked = dm_picked_data_path(&stale) ?? ""
+        if stale.boolValue && picked.isEmpty {
+            note = "The location you picked before is no longer readable (the app was signed differently). Please choose it again."
         }
     }
 }
 
-/// UIDocumentPickerViewController for a folder, in the two callbacks a SwiftUI sheet wants.
+/// UIDocumentPickerViewController for files and folders, in the two callbacks a SwiftUI sheet wants.
 private struct DocumentPicker: UIViewControllerRepresentable {
-    var types: [UTType] = [.folder]
     let onPick: (URL) -> Void
     let onCancel: () -> Void
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        // .open (not .import): the folder stays where it is and the bookmark keeps pointing at it.
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
+        // .open (not .import): the file stays where it is and the bookmark keeps pointing at it,
+        // which is the whole point — an import would copy 16 GB into the app's container.
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: false)
         picker.allowsMultipleSelection = false
         picker.delegate = context.coordinator
         return picker
@@ -128,7 +132,7 @@ private struct LauncherView: View {
                     } footer: {
                         Text("Brings back all settings this game was tested with.")
                     }
-                    CloudSavesSection()
+                    GameDataSection()
                     Section {
                         HStack {
                             Text("Memory available")

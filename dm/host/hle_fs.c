@@ -7,6 +7,7 @@
 #include "hle.h"
 #include <mach/mach.h>
 #include "front.h"
+#include "romfs_arc.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -17,7 +18,6 @@
 #include <sys/clonefile.h>
 #include <sys/xattr.h>
 #include "romfs_image.h"
-#include "save_sync.h"
 
 // Every take-over in this file runs on the big host stack (hle_bigstack.c): path buffers are sized by PATH_MAX and one file open takes 6-7 KB of stack, while a game's save thread can have as little as 8 KB (Super Mario 3D World + Bowser's Fury)
 #undef HLE_FORCE
@@ -210,8 +210,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
         const char *why = NULL;
         if (!access(work, F_OK) && rm_tree(work)) why = "cannot clear the work directory left over from last time";
         else if (!access(neu, F_OK) && rm_tree(neu)) why = "cannot clear the .new left over from last time";
-        else if (dm_fs_test_fail("mountclone") || clonefile(dir, work, 0))   // ENOTSUP: HFS+ and exFAT can neither clone nor swap directories (RENAME_SWAP), so no transaction can work on them
-            why = errno == ENOTSUP ? "the save folder's filesystem cannot clone directories (save transactions need APFS: set DM_SAVE to a folder on an APFS volume)" : "cloning the work directory failed";
+        else if (dm_fs_test_fail("mountclone") || clonefile(dir, work, 0)) why = "cloning the work directory failed";
         if (why) { txn_err = errno ? errno : EIO; g_mnt[g_nmnt].ro = 1; strlcpy(g_mnt[g_nmnt].dir, dir, sizeof g_mnt[0].dir);
             LOG("[RED] save transaction: %s (%s, errno=%d) -- mounting the committed directory %s read-only instead: saves cannot be written this session, the committed version is unchanged", why, work, txn_err, dir); }
         else {
@@ -223,12 +222,8 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     } else strlcpy(g_mnt[g_nmnt].dir, dir, sizeof g_mnt[0].dir);
     g_mnt[g_nmnt].img = NULL;
     struct stat ist;
-    if (ro && !txn) {   // game files: a RomFS folder, or a RomFS image file in its place
-        // A path that is neither is a stale or mistyped one (an old run command still naming the RomFS folder a rebuild replaced with RomFS.img): stop here, not at the game's
-        // first failed read (Echoes of Wisdom crashed 0.3 s after nnMain, GitHub issue #615). Add-on content and system data check their own paths before they mount
-        if (stat(dir, &ist) || !(S_ISDIR(ist.st_mode) || S_ISREG(ist.st_mode)))
-            die("the game files %s (%s:) are missing: neither a folder nor a RomFS image (the rom mount is DM_ROMFS, or $DM_ROOT/romfs when DM_ROMFS is unset)", dir, name);
-        if (S_ISREG(ist.st_mode) && !(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s are not a complete RomFS image", dir);
+    if (ro && !txn && !stat(dir, &ist) && S_ISREG(ist.st_mode)) {   // a RomFS image file in place of a folder
+        if (!(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s are not a complete RomFS image", dir);
     }
     g_nmnt++;
     pthread_mutex_unlock(&g_lock);
@@ -388,6 +383,28 @@ static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create)
         char normed[1024]; const char *rest = c + 1;
         if (strstr(rest, "/.")) { if (!norm_rest(rest, normed, sizeof normed)) return 0; rest = normed; }   // only paths with "." components are normalized; the rest walk component by component as before
         if (g_mnt[i].overlay[0] && !create) return rom_overlay_path(&g_mnt[i], rest, out, n);
+        // Archive mount: the RomFS tree lives inside a ROMFSARC archive, so the host path is a
+        // synthetic "@romfsarc:<guest path>" that the file calls below route to romfs_arc.c. Matched
+        // by the mount directory (romfsarc_open recorded the base it actually opened), because the
+        // mount name differs between games (rom, content).
+        if (romfsarc_active() && g_mnt[i].ro && !create && g_mnt[i].dir[0] && !strcmp(g_mnt[i].dir, g_arc_base)) {
+            // Fold runs of '/' the way the directory walk below does: the archive index stores one
+            // separator per level, and a game may ask for "data:/bin/appli/icon_sick//bin/x.arc"
+            // (Pokemon Sword's Bag: the doubled slash missed the lookup and the game then
+            // dereferenced the null it got back — PR #9).
+            char folded[1024]; const char *r = rest;
+            if (strstr(rest, "//")) {
+                size_t o = 0; int slash = 0;
+                for (const char *q = rest; *q; q++) {
+                    if (*q == '/') { if (slash) continue; slash = 1; } else slash = 0;
+                    if (o + 1 >= sizeof folded) { errno = ENAMETOOLONG; return 0; }
+                    folded[o++] = *q;
+                }
+                folded[o] = 0; r = folded;
+            }
+            if (snprintf(out, n, ROMFSARC_SYNTH_PREFIX "%s", r) >= (int)n) { errno = ENAMETOOLONG; return 0; }
+            return 1;
+        }
         strlcpy(out, g_mnt[i].dir, n);
         while (*rest) {
             while (*rest == '/') rest++;
@@ -432,9 +449,22 @@ static Result err_res(const char *op, const char *path) {
 
 // ---------- Mount ----------
 HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv; rom reads the host directory directly, the cache gets only the minimum size", Result, h_fs_QueryRomCache, size_t *out) { *out = 0x1000; return RES_OK; }
-HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
+HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory (or a ROMFSARC archive)", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
     (void)cache; (void)sz; char b[1024];
-    Result r = mount(name, envdir("DM_ROMFS", "romfs", b, sizeof b), 1);
+    const char *dir = envdir("DM_ROMFS", "romfs", b, sizeof b);
+    // Archive mount: romfsarc_open tries <dir>.idx, <dir>/romfs.idx and <dir>/romfs/romfs.idx, so the
+    // player may copy the shards either beside the folder or into Documents/romfs/ itself.
+    romfsarc_hdr h;
+    if (romfsarc_open(dir, &h) == 0) {
+        // Mount the resolved archive base (romfsarc_open recorded the one that worked in g_arc_base).
+        // host_path_ex compares the mount directory against it.
+        Result r = mount(name, g_arc_base, 1);
+        if (r != RES_OK) { romfsarc_close(); return r; }
+        LOG("fs rom: archive %s (%llu files, %llu dirs, %u shards, tree hash %016llx)", g_arc_base,
+            (unsigned long long)h.file_count, (unsigned long long)h.dir_count, h.shard_count, (unsigned long long)h.tree_hash);
+        return RES_OK;
+    }
+    Result r = mount(name, dir, 1);
     if (r == RES_OK && getenv("DM_ROMFS_OVERLAY")) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) {
@@ -591,7 +621,7 @@ HLE_FORCE("_ZN2nn2fs14ExtendSaveDataERKNS_7account3UidEll", "fsp-srv; extend sav
 HLE_FORCE("_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", "fsp-srv; the save directory is created at mount time", Result, h_fs_EnsureSave, const void *uid) { (void)uid; return RES_OK; }
 // Another application's save data (Tears of the Kingdom asks by application ID and would mount it read-only): the host keeps only this game's own save, which exists once mounted
 HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", "fsp-srv; only this game's own save data exists", int, h_fs_SaveExisting, uint64_t app, const void *uid) {
-    (void)uid; LOG("fs asks whether save data exists: program %016llx → %s", (unsigned long long)app, app == DM_GAME_PROGRAM_ID ? "this game, yes" : "another program, no"); return app == DM_GAME_PROGRAM_ID;
+    (void)uid; LOG("fs asks whether save data exists: program %016llx → %s", (unsigned long long)app, app == dm_profile()->program_id ? "this game, yes" : "another program, no"); return app == dm_profile()->program_id;
 }
 HLE_FORCE("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", "fsp-srv; another program's save data: none", Result, h_fs_MountSaveRO, const char *name, uint64_t app, const void *uid) {
     (void)uid; LOG("[RED] fs read-only mount of another program's save data %s: program %016llx, the host has none", name, (unsigned long long)app); return 0x7d402u;   // fs ResultTargetNotFound
@@ -602,7 +632,6 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv; save data 
     const char *d = getenv("DM_SAVE");
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;   // strip trailing slashes (.work / .new are appended at the same level)
-    save_sync_mount(dd, DM_GAME_ID);   // DM_SAVE_SYNC: the cloud's save comes in before the work directory is cloned from the committed one (save_sync.h)
     return mount_ex(name, dd, 0, 1);
 }
 // Device save data: one save for the console instead of one per user. Animal Crossing: New Horizons keeps its island there (3.0.3's main mounts no account save data at all); the host
@@ -615,7 +644,6 @@ HLE_FORCE("_ZN2nn2fs19MountDeviceSaveDataEPKc", "fsp-srv; device save data → t
     const char *d = getenv("DM_SAVE");
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;
-    save_sync_mount(dd, DM_GAME_ID);   // the cloud's save holds both, so it comes in at whichever of the two mounts first
     strlcat(dd, "_device", sizeof dd);
     return mount_ex(name, dd, 0, 1);
 }
@@ -625,13 +653,6 @@ HLE_FORCE("_ZN2nn2fs20ExtendDeviceSaveDataEll", "fsp-srv; extend device save dat
 HLE_FORCE("_ZN2nn2fs22GetSaveDataRestoreFlagEPbPKc", "fsp-srv; save data restored from a backup: never", Result, h_fs_RestoreFlag, uint8_t *out, const char *name) { (void)name; *out = 0; return RES_OK; }
 static _Atomic uint64_t g_save_commits;   // number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
-// The cloud sender's copy of a committed save (save_sync.c): a Commit holds both locks for its clone and swap, so the clone taken under them is one whole committed version
-int dm_fs_clone_committed(const char *dir, const char *to) {
-    PATH_LOCK(); pthread_mutex_lock(&g_lock);
-    int r = clonefile(dir, to, 0) ? -1 : 0, e = errno;
-    pthread_mutex_unlock(&g_lock);
-    errno = e; return r;
-}
 // Both Commit overloads share this transaction engine. Caller holds the path
 // and mount locks; front-end failure notification is delivered after unlocking.
 static Result commit_mount_locked(int i, int *notify_error) {
@@ -669,15 +690,14 @@ static Result commit_mount_locked(int i, int *notify_error) {
     }
     char neu[1100]; snprintf(neu, sizeof neu, "%s.new", g_mnt[i].commit);
     Result r = RES_OK;
-    if (!access(neu, F_OK) && rm_tree(neu)) { LOG("[RED] save commit: cannot clear the %s left over errno=%d (committed version unchanged)", neu, errno); r = RES_FAIL; }
-    else if (clonefile(g_mnt[i].dir, neu, 0)) { LOG("[RED] save commit: clonefile %s failed errno=%d (committed version unchanged)", neu, errno); r = RES_FAIL; }
+    if (!access(neu, F_OK)) rm_tree(neu);
+    if (clonefile(g_mnt[i].dir, neu, 0)) { LOG("[RED] save commit: clonefile %s failed errno=%d (committed version unchanged)", neu, errno); r = RES_FAIL; }
     else if (renamex_np(neu, g_mnt[i].commit, RENAME_SWAP)) { LOG("[RED] save commit: atomic swap failed errno=%d (committed version unchanged)", errno); rm_tree(neu); r = RES_FAIL; }
     else rm_tree(neu);                                                  // the old version that was swapped out
     // Timing readouts (integer microseconds, no floating point): how long the clone + atomic swap took; how long in total from this transaction's first save write to the end of the commit (the game writing files + the commit; 0 = no save write in this transaction)
     static int n; if (r == RES_OK) { uint64_t tc2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (clone + swap %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
             (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
-        save_sync_committed();   // wakes the cloud sender, which clones the committed save through dm_fs_clone_committed above (save_sync.h)
     }
     return r;
 }
@@ -724,6 +744,43 @@ HLE_FORCE("_ZN2nn2fs14CommitSaveDataEPKc", "fsp-srv; same as Commit (SDK 11's ol
 HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; the mount table is permanent, unmounting is a no-op", void, h_fs_Unmount, const char *name) { (void)name; }
 
 // ---------- Files ----------
+// ---------- Archive-backed file handles ----------
+// An archive file has no host fd. It gets a handle number from a private table, and every operation
+// on it (ReadFile, GetFileSize, CloseFile) checks the table first. Handle numbers are distinct from
+// fds: real handles are fds (>= 3 in practice), archive handles are tagged by index into g_arc[].
+// Like every host handle they reach the guest through FH_OUT (shifted left by 4, 16-byte aligned) and come back
+// through FH_IN, so the tag sits at bit 57: below IMG_H's bit 58, and it still fits after the shift.
+typedef struct { uint32_t shard; uint64_t off, size; int used; } archandle;
+#define MAX_ARCH 4096
+static archandle g_arc[MAX_ARCH];
+static uint64_t g_arch_gen;   // bumped on open/close so a stale handle never hits a recycled slot
+static uint64_t arc_new(uint32_t shard, uint64_t off, uint64_t size) {
+    for (int i = 0; i < MAX_ARCH; i++) if (!g_arc[i].used) {
+        g_arc[i].used = 1; g_arc[i].shard = shard; g_arc[i].off = off; g_arc[i].size = size;
+        return ((uint64_t)1 << 57) | ((g_arch_gen & 0xffffff) << 32) | (uint32_t)i;
+    }
+    return 0;
+}
+static int arc_get(uint64_t h, archandle **out) {
+    if ((h >> 57) != 1) return 0;
+    uint32_t i = (uint32_t)h;
+    if (i >= MAX_ARCH || !g_arc[i].used) return 0;
+    if ((uint32_t)((h >> 32) & 0xffffff) != (uint32_t)(g_arch_gen & 0xffffff)) return 0;
+    *out = &g_arc[i]; return 1;
+}
+static void arc_free(uint64_t h) {
+    archandle *a; if (arc_get(h, &a)) a->used = 0;
+}
+static const char *arc_rel(const char *hp) {
+    const char *rel = ROMFSARC_SYNTH_REL(hp);
+    while (*rel == '/') rel++;
+    return rel;
+}
+static int arc_file(const char *hp, uint32_t *shard, uint64_t *off, uint64_t *size) {
+    return romfsarc_stat_file(arc_rel(hp), shard, off, size);
+}
+static int arc_dir(const char *hp) { return romfsarc_is_dir(arc_rel(hp)); }
+static void arc_norm(const char *hp, char *rel, size_t n) { strlcpy(rel, arc_rel(hp), n); }
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
     int mi; int64_t k;
     if (img_path(path, &mi, &k)) {
@@ -736,6 +793,15 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     }
     HP(path);
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
+    if (ROMFSARC_IS_SYNTH(hp)) {   // archive entry: no fd, the handle carries shard/offset/size
+        uint32_t shard; uint64_t off, size;
+        if (!arc_file(hp, &shard, &off, &size)) { errno = ENOENT; return err_res("open", hp); }
+        uint64_t ah = arc_new(shard, off, size);
+        if (!ah) { errno = EMFILE; return err_res("open", hp); }
+        *out = FH_OUT(ah);
+        if (g_flag.fs) LOG("fs open %s mode=%d → archive handle (shard %u off %llu size %llu)", path, mode, shard, (unsigned long long)off, (unsigned long long)size);
+        return RES_OK;
+    }
     int fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
     if (fd < 0) return err_res("open", hp);
     struct stat st; fstat(fd, &st);
@@ -759,6 +825,20 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
         sz = off < 0 || (uint64_t)off >= x->b ? 0 : (size_t)(x->b - off) < sz ? (size_t)(x->b - off) : sz;
     }
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
+    archandle *ah;
+    if (arc_get(h, &ah)) {   // archive entry: clamp to the file, read from its shard
+        if (off < 0) { *out = 0; return RES_FAIL; }
+        uint64_t avail = (uint64_t)off < ah->size ? ah->size - (uint64_t)off : 0;
+        size_t want = sz < avail ? sz : (size_t)avail;
+        if (want) { ssize_t r = romfsarc_pread(ah->shard, ah->off + (uint64_t)off, buf, want);
+            if (r < 0) return err_res("pread (archive)", "handle"); got = (size_t)r; }
+        *out = got;
+        if (g_flag.fs) { static uint64_t n, bytes, next_b = 64 << 20; static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+            pthread_mutex_lock(&m); n++; bytes += got;
+            if (bytes >= next_b || n % 1000 == 0) { LOG("fs read total: %llu reads %.1f MiB (this one: archive offset %lld length %#zx)", n, bytes / 1048576.0, (long long)off, got); if (bytes >= next_b) next_b += 64 << 20; }
+            pthread_mutex_unlock(&m); }
+        return RES_OK;
+    }
     while (got < sz) {
         ssize_t r = pread(fd, (uint8_t *)buf + got, sz - got, base + off + got);
         if (r < 0) { if (errno == EINTR) continue;
@@ -815,6 +895,7 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
 }
 HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", Result, h_fs_GetFileSize, int64_t *out, uint64_t h) { h = FH_IN(h);
     if (!h) return RES_FAIL;
+    archandle *ah; if (arc_get(h, &ah)) { *out = (int64_t)ah->size; return RES_OK; }
     if (IMG_H(h)) { *out = (int64_t)g_mnt[IMG_M(h)].img->e[IMG_K(h)].b; return RES_OK; }
     struct stat st; if (fstat((int)h, &st)) return err_res("fstat", "fd");
     *out = st.st_size; return RES_OK;
@@ -831,6 +912,7 @@ HLE_FORCE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", "fsp-srv → ftruncate(2)
 HLE_FORCE("_ZN2nn2fs9FlushFileENS0_10FileHandleE", "fsp-srv; host writes are already in the page cache, flushing is a no-op", Result, h_fs_FlushFile, uint64_t h) { (void)h; return RES_OK; }
 HLE_FORCE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", "fsp-srv → close(2)", void, h_fs_CloseFile, uint64_t h) { h = FH_IN(h);
     if (!h || IMG_H(h)) return;   // the null handle after a failed open (see ReadFile): do not touch fd 0; an image entry holds no descriptor
+    if ((h >> 57) == 1) { arc_free(h); return; }   // archive entry: nothing to close
     g_fmode[(int)h & 0xffff] = 0; atomic_store(&g_ftxn[(int)h & 0xffff], 0);
     close((int)h); }
 HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { h = FH_IN(h); return IMG_H(h) ? MODE_READ : g_fmode[(int)h & 0xffff]; }
@@ -853,20 +935,13 @@ HLE_FORCE("_ZN2nn2fs15CreateDirectoryEPKc", "fsp-srv → mkdir(2)", Result, h_fs
     if (mkdir(hp, 0755)) return err_res("mkdir", hp);
     if (set_guest_name(hp, path)) { int e = errno; rmdir(hp); errno = e; return err_res("mkdir name", hp); }
     return RES_OK; }
-// Delete one directory entry: a directory with its tree, anything else (a symlink too, never followed) with unlink. lstat, not d_type: a filesystem may report DT_UNKNOWN
-static int rm_entry(const char *c) {
-    struct stat st; if (lstat(c, &st)) return -1;
-    return S_ISDIR(st.st_mode) ? rm_tree(c) : unlink(c);
-}
 static int rm_tree(const char *p) {
-    struct stat st; if (lstat(p, &st)) return -1;
-    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }   // a symlink to a directory is not entered: opendir would follow it and empty its target
     DIR *d = opendir(p); if (!d) return -1;
     struct dirent *e; char c[1024]; int rc = 0;
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         snprintf(c, sizeof c, "%s/%s", p, e->d_name);
-        rc |= rm_entry(c);
+        rc |= e->d_type == DT_DIR ? rm_tree(c) : unlink(c);
     }
     closedir(d);
     return rc | rmdir(p);
@@ -882,7 +957,7 @@ HLE_FORCE("_ZN2nn2fs25CleanDirectoryRecursivelyEPKc", "fsp-srv → recursively d
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         snprintf(c, sizeof c, "%s/%s", hp, e->d_name);
-        rc |= rm_entry(c);
+        rc |= e->d_type == DT_DIR ? rm_tree(c) : unlink(c);
     }
     closedir(d);
     return rc ? err_res("cleandir", hp) : RES_OK;
@@ -921,12 +996,39 @@ HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → 
     int mi; int64_t k;
     if (img_path(path, &mi, &k)) { if (k < 0) return err_res("stat", path); *out = g_mnt[mi].img->e[k].type ? ENT_FILE : ENT_DIR; return RES_OK; }
     HP(path); struct stat st;
+    if (ROMFSARC_IS_SYNTH(hp)) {   // archive entry or directory, from the index
+        const char *rel = arc_rel(hp);   // the index stores paths without a leading slash (abe35a3)
+        uint32_t sh; uint64_t of, szf;
+        if (romfsarc_stat_file(rel, &sh, &of, &szf)) { *out = ENT_FILE; return RES_OK; }
+        if (romfsarc_is_dir(rel)) { *out = ENT_DIR; return RES_OK; }
+        errno = ENOENT; return err_res("stat", hp);
+    }
     if (stat(hp, &st)) return err_res("stat", hp);
     *out = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; return RES_OK;
 }
 
 // ---------- Directories ----------
 typedef struct { DIR *d; char path[1024]; DIR *od; char opath[1024]; DirectoryEntry *snap; int64_t nsnap, psnap; int mode; } dirh_t;
+
+// An archive directory has no host DIR: its entries come from the index, copied into the same
+// snapshot list the overlay mount uses, so ReadDirectory has one path for both.
+static void arc_snapshot(dirh_t *h, const char *hp) {
+    char rel[1024]; arc_norm(hp, rel, sizeof rel);
+    int n = romfsarc_count(rel);
+    if (n <= 0) return;
+    romfsarc_ent *ents = malloc((size_t)n * sizeof *ents);
+    if (!ents) die("archive directory snapshot allocation failed");
+    int got = romfsarc_list(rel, ents, n);
+    if (got <= 0) { free(ents); return; }
+    h->snap = calloc((size_t)got, sizeof *h->snap); h->nsnap = got;
+    if (!h->snap) die("archive directory snapshot allocation failed");
+    for (int i = 0; i < got; i++) {
+        strlcpy(h->snap[i].name, ents[i].name, sizeof h->snap[i].name);
+        h->snap[i].type = ents[i].is_dir ? ENT_DIR : ENT_FILE;
+        h->snap[i].size = ents[i].is_dir ? 0 : ents[i].size;
+    }
+    free(ents);
+}
 static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
     char fwd[1024]; rest = fwd_slashes(rest, fwd, sizeof fwd);
     char *roots = strdup(m->overlay);
@@ -988,11 +1090,17 @@ HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → o
         }
         *out = (uint64_t)h; return RES_OK;
     }
-    HP(path); DIR *d = opendir(hp);
+    HP(path);
+    if (ROMFSARC_IS_SYNTH(hp)) {   // archive directory: no host DIR, only the snapshot
+        if (!arc_dir(hp)) { errno = ENOTDIR; return err_res("opendir", hp); }
+        dirh_t *ah = calloc(1, sizeof *ah); if (!ah) die("directory handle allocation failed");
+        strlcpy(ah->path, hp, sizeof ah->path); ah->mode = mode;
+        arc_snapshot(ah, hp);
+        *out = (uint64_t)ah; return RES_OK;
+    }
+    DIR *d = opendir(hp);
     if (!d) return err_res("opendir", hp);
-    dirh_t *h = calloc(1, sizeof *h);
-    if (!h) { int e = errno; closedir(d); errno = e; return err_res("directory allocation", hp); }
-    h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
+    dirh_t *h = calloc(1, sizeof *h); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
     const char *c = strchr(path, ':');
     if (c) for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].overlay[0] && strlen(g_mnt[i].name) == (size_t)(c - path) && !strncmp(g_mnt[i].name, path, (size_t)(c - path))) {
         dir_snapshot(h, &g_mnt[i], c + 1); break;
@@ -1003,6 +1111,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
     if (!hh) { *count = 0; return RES_FAIL; }
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0; struct dirent *e;
     if (h->snap) { while (n < max && h->psnap < h->nsnap) { DirectoryEntry *src = &h->snap[h->psnap++]; if (!(h->mode & (src->type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE))) continue; ents[n++] = *src; } *count = n; return RES_OK; }
+    if (!h->d) { *count = 0; return RES_OK; }   // an archive directory that turned out empty (no snapshot, no host DIR)
     int dfd = dirfd(h->d);
     while (n < max && (e = readdir(h->d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;

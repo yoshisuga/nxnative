@@ -1,46 +1,48 @@
 # Contributing
 
-Issues and pull requests are welcome. This page says how a change gets in; what the code does and where things are is in [AGENTS.md](AGENTS.md) and [docs/development.md](docs/development.md).
+Issues and pull requests are welcome. NX2Apple is the launcher (`frontend/`, `frontend-qt/`) and the glue around the [nxnative](https://github.com/seedds/nxnative) engine, which is vendored here as upstream plus a queue of patches, and bumped to upstream's latest every day. [AGENTS.md](AGENTS.md) describes the engine. Building by hand from a terminal (tools, `prod.keys`, the IPA) is on its own page: [BUILDING.md](BUILDING.md).
 
 ## Reporting a problem
 
-Open an issue with the bug report form. It asks for what a problem is traced with: the nxnative commit, the shader chain version, the game's title ID and version, the device and OS, how the game was built and run, environment overrides, and the whole log of the run. [Playing](docs/playing.md) says where the iPhone app's log is; a Mac app writes `~/Library/Logs/nxnative/<title ID>.log`.
+Game problems, build problems and launcher problems each have an issue form (`.github/ISSUE_TEMPLATE/`); the form asks for what a report needs — versions, device, Copy diagnostics and the game's log. Use it from the Issues page; a report without those is usually unactionable.
 
-`python3 scripts/bug_report.py <title ID | path to the .app | NSP folder>` collects most of this into one zip to attach: `report.md` with the game, commit, chain version, device, settings and the list of files, plus the Mac app's logs, the NSP script's logs under `<title ID>_build/logs` and recent crash reports. Add `--ios-log log.txt` for an iPhone log. It reads only text logs and settings, never game files or keys; it writes your home folder as `~` and drops lines that look like key material. Look at the zip before you attach it.
+## Where an issue goes
 
-## Never game files or keys
+- **Here:** the app, a build or install that fails, and a game that does not run well on your Mac or iPhone or iPad.
+- **[seedds/nxnative](https://github.com/seedds/nxnative/issues):** how the engine works, porting a new game, a rendering fault you have traced into the engine itself.
 
-Never commit or attach game files, keys, title keys or anything extracted from a game: RomFS, code modules, shaders, dumps. Game files and their extractions stay in the game's NSP folder ([AGENTS.md](AGENTS.md)). Logs, screenshots, title IDs, build IDs and offsets are fine.
+## What a report needs
 
-## Before you start
+Pick a form: **Game problem**, **Build problem** or **Launcher problem or idea**. Each asks for what the problem is traced with: the game, its title ID and versions, the target, the device and OS, the NX2Apple version, **Settings > Copy diagnostics**, and the log (a game's log, or the Build log on the Builds page). A report without them gets a request for them first. Where a game's log is: a Mac game in a library folder writes `log/<title ID>.log` beside its app, otherwise `~/Library/Logs/nxnative/<title ID>.log`; on an iPhone or iPad it is `log.txt` in the Files app.
 
-- Read [AGENTS.md](AGENTS.md): it lists where to start for each kind of task, and the rules for profiles, per-build knowledge and the shader translation chain.
-- A crash, a hang or a wrong picture: search the [symptom index](docs/agents/symptoms.md) for the text in the log first.
-- Another game: run `scripts/build_ipa_from_nsp.py` on its NSP folder and follow [Port another game](docs/development.md#port-another-game).
-- Prefer a fix that holds for every game to a game-specific rule, and fix a bug at its cause ([AGENTS.md](AGENTS.md)).
+**Never attach keys, game files or anything extracted from a game.** Logs, screenshots, title IDs and build IDs are fine.
+
+## Helping with games
+
+Each new game needs its own bring-up: a profile (build IDs, memory layout, texture slots), a shader
+reader if it packs them in a form we do not read, and patch points. **Two ways to help, both
+useful:**
+
+- **Report a game that works** — if you got a title outside the verified list running, open an issue
+  with the title ID, the update version, and what you did. It becomes a profile others can use.
+- **Send the shaders that are missing** — if a game runs but stutters on first use of an effect, its
+  shader variants are missing from the map. The host can dump what it cannot find
+  (`DM_NVN_SHDUMP=<dir>`); attach those and we add them to `shader_map.tsv` for everyone.
+
+Issues with a full `Documents/log.txt` get looked at first — that log usually names the exact
+missing piece.
 
 ## A pull request
 
-- **One change per PR, off `main`.** Rebase on `main` rather than merging it in.
-- **Commits.** Each commit message says what changed and why, in plain English sentences, as the history does: the symptom, the cause, the fix, and what was measured or checked.
-- **Where findings go.** A fact about one game goes in its note (`dm/games/<id>/README.md`). A general mechanism gets an entry in `docs/reference/<subsystem>.md` (Symptom, Cause, Fix, Found on), followed by `python3 dm/tools/docs_symptoms.py`. A new game takes its profile, its note and its row in the games table ([dm/games/README.md](dm/games/README.md)).
-- **The README gallery.** After Mac gameplay testing, add its screenshot to `docs/images/` and its row to [gallery.tsv](docs/images/gallery.tsv), then run `python3 dm/tools/docs_gallery.py`. The table preserves your chosen order; notes hold the IPA size and noteworthy features or limitations. Leave the note empty until the IPA size is measured. Concurrent additions merge in the TSV; regenerate README to resolve a conflict inside its gallery. Conflicting rows for one game need a manual resolution before regeneration.
-- **The shader chain.** After changing one of its tools, run `python3 dm/gfx/tools/dmsh_chain.py --header` and commit `dm/gfx/nvn/dmsh_chain.h` with the change. Every game's shaders are then rebuilt, so say which games you checked.
-- **Tests.** CI runs the host tests, the CPU-only graphics tests, the tool tests and the builds ([Continuous integration](docs/development.md#continuous-integration)). GitHub's runners have no Metal 4, so run the GPU tests on an Apple-silicon Mac: `make -C dm/gfx/tests GAME=<id> run`.
-- **The PR text.** Fill in the template: what and why, what was checked (tests, games, devices), and which docs changed.
+- One change per PR, off `main`. Commit messages say what changed and why, in plain English, as `git log` does.
+- Fill in the PR template: what and why, what was checked, screenshots for UI changes.
+- **`frontend/` and `frontend-qt/` are the fork's own:** change them freely. Run `cd frontend && swift test`; for a UI change also capture the views for visual QA (`NX_LAUNCHER_CAPTURE_DIR`, see [frontend/README.md](frontend/README.md#verification)).
+- **`dm/`, `scripts/`, `docs/`, `ref/` and `AGENTS.md` are upstream plus the patch queue.** They are generated: seedds/nxnative at the commit in `.upstream-ref` with the patches in `patches/` applied, so a direct edit fails `scripts/patches.py check` (the `pr-scope` and `patch-queue` jobs) and would be lost on the next bump. The failure names the command: `python3 scripts/patches.py absorb <files>` folds a direct edit into the patch that already touches the file (a new file may need `--into <patch>`); commit `patches/` with it. For a change that needs a patch of its own, commit the change, turn it into a patch with `scripts/patches.py export <commit>`, fill in its header (`Upstream-Status`, `Reason`, `Issue`), and send the same change to seedds/nxnative so the patch can go: [patches/README.md](patches/README.md) walks through it and states the patch policy (what a patch may and may not change). Files under `.github/` and in the repository root that are not in that list (this file, `CLAUDE.md`, the README) are the fork's.
 
-## Large changes and other platforms
+## For AI agents and other tools
 
-- **Agree on the scope first.** Open an issue before writing a change that adds a platform or device class, adds a second implementation of an existing path (for example a rendering path for GPUs without Metal 4), or runs to more than about 1,000 lines. A large PR built on an older `main` can rarely be reviewed or merged, however well it was tested.
-- **One concern per PR.** A new front end, a platform baseline and one game's fixes are separate PRs, each on current `main`.
-- **Supported devices** are the ones [README.md](README.md) names: iOS / iPadOS 26 or later on an iPhone with an A17 Pro chip or later or an iPad with an M1 chip or later, and Macs with Apple silicon. Supporting older devices or Intel Macs is the maintainer's decision, so ask in an issue first: it would add code paths that every later change has to keep working and that few contributors can test.
+Issue forms and the PR template apply in the browser only. `gh issue create`, the API and MCP tools skip the forms, so follow them yourself:
 
-## Graphical front ends
-
-An app that packs games, lists them or starts them (a build window, a game library) is a separate project that builds on nxnative, not a part of this repository. [NX2Apple](https://github.com/LNPANDY/NX2Apple) is one, and [README.md](README.md) points players to it. Such an app needs no changes here to work: the NSP script reports its stages as JSON lines (`--progress json`), a built Mac app or IPA carries the list of its game's settings (`dm/launcher.json`, from `dm/games/settings.tsv`), and the app takes those settings as environment switches or as saved choices in its preferences, which every start reads ([Front ends](docs/frontends.md)). When a front end needs more from nxnative (a new event, a field in the settings list), open an issue or a small PR for that piece.
-
-The settings screen inside the iPhone and iPad app and the settings window inside a Mac app are part of nxnative ([Settings](docs/settings.md)): they draw the same list and keep the same saved choices as any front end.
-
-## How changes get in
-
-The maintainer reviews every PR. A PR is often taken in as a squashed or reworked commit on `main` that credits its author (`Co-authored-by`), and the PR is then closed rather than merged; that is expected. The maintainer may rebase or rework a PR that conflicts with `main` while taking it in.
+- **Issues.** Write the body as `###` headings with the same names as the form's fields (for example `### Game, title ID and versions`, `### Copy diagnostics`, `### The game's log`) and fill every required field from [.github/ISSUE_TEMPLATE](.github/ISSUE_TEMPLATE). Ask the user for what you cannot read yourself: the Copy diagnostics output, the log, the versions. If a required field is missing, do not open the issue.
+- **Pull requests.** Use the sections of [.github/pull_request_template.md](.github/pull_request_template.md): `gh pr create --template .github/pull_request_template.md`, or the same headings in `--body`. A change to a vendored path follows the rule above.
+- Never attach or commit keys, game files or data extracted from a game, and do not paste key values into a log or a diagnostics report.

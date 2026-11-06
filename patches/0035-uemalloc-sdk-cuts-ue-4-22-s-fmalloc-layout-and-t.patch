@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoshi Sugawara <yoshi.sugawara@gmail.com>
+Date: Thu, 29 Oct 2026 12:24:53 -1000
+Subject: [PATCH] uemalloc, sdk cuts: UE 4.22's FMalloc layout and the SDK cuts
+ of Bloodstained: Ritual of the Night 1.60
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: 1.60's FMallocBinned3 reserves 37 GB and its SDK 7 build starts regions 1 GB into the alias region
+Issue: none yet (Bloodstained: Ritual of the Night 1.60 bring-up)
+
+---
+ dm/host/hle_uemalloc.c  | 14 +++++++++++---
+ dm/tools/sdk_patches.py |  8 ++++++++
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/hle_uemalloc.c b/dm/host/hle_uemalloc.c
+index 2ba433f4..74bfcc65 100644
+--- a/dm/host/hle_uemalloc.c
++++ b/dm/host/hle_uemalloc.c
+@@ -16,6 +16,9 @@
+ // 23 DumpAllocatorStats, 24 IsInternallyThreadSafe, 25 ValidateHeap, 26 GetDescriptiveName, 27-29 OnMallocInitialized / OnPreFork / OnPostFork, 30-31 the free cached memory sizes (main+0x67df800;
+ // the base FMalloc vtable main+0x67dff48 has 0 for the three pure slots 6 / 8 / 10, its 7 / 9 call +0x30 / +0x40, and its 11 and 12 are one function: +0x30, then memset). The zeroed slots
+ // keep the guest's function, which calls Malloc through the vtable
++// Unreal Engine 4.22 (Bloodstained: Ritual of the Night 1.60) has no TryMalloc / TryRealloc yet: 0-1 destructors, 2 Exec, 3 Malloc, 4 Realloc, 5 Free, 6 QuantizeSize, 7 GetAllocationSize,
++// 8 Trim, 9 SetupTLSCachesOnCurrentThread, 10 ClearAndDisableTLSCachesOnCurrentThread, 11-13 the stats (InitializeStatsMetadata, UpdateStats, GetAllocatorStats: each a ret), 14 DumpAllocatorStats,
++// 15 IsInternallyThreadSafe (returns 1; GCreateMalloc calls +0x78), 16 ValidateHeap, 17 GetDescriptiveName ("Binned3") (main+0xc3b8fa0: 18 slots, the relocations end there)
+ // Fixed addresses: each row runs only on the main build it was found in (AGENTS.md)
+ #include "hle.h"
+ #include <malloc/malloc.h>
+@@ -23,11 +26,12 @@
+ #include <stdatomic.h>
+ 
+ // Slot layouts: which slots the host fills and which do nothing (up to 6; 0 ends the list); the others keep the guest's own functions
+-enum { UE5, UE4_27, UE5_6 };
++enum { UE5, UE4_27, UE5_6, UE4_22 };
+ static const struct { int nslot, malloc_, try_malloc, realloc_, try_realloc, free_, quantize, get_size, nothing[6]; } k_lay[] = {
+     [UE5] = { 26, 6, 7, 8, 9, 10, 11, 12, { 13, 14, 15, 19 } },      // Trim, the TLS cache setup and teardown, DumpAllocatorStats
+     [UE4_27] = { 21, 3, 4, 5, 6, 7, 8, 9, { 10, 11, 12, 16 } },
+     [UE5_6] = { 32, 6, 7, 8, 9, 10, 13, 14, { 15, 16, 17, 18, 19, 23 } },   // Trim, the four TLS cache calls, DumpAllocatorStats
++    [UE4_22] = { 18, 3, 0, 4, 0, 5, 6, 7, { 8, 9, 10, 14 } },          // no Try slots (0: none, slot 0 is a destructor)
+ };
+ static const struct { const char *build, *what; int layout; uint64_t obj, vtable, cut; } k_ue[] = {
+     // Octopath Traveler 0 1.0.5: the FMallocBinned3 object (main+0x68022c8, bss), its vtable (main+0x5b06f38, 26 slots), the cut constructor call (main+0x12e40, a nop after the rewrite)
+@@ -47,6 +51,9 @@ static const struct { const char *build, *what; int layout; uint64_t obj, vtable
+     { "84e182f72ee1da4f477804bd05b54c15", "FINAL FANTASY RESONANCE 1.0.1", UE5_6, 0x77c6210, 0x67df800, 0x137f0 },
+     // Asian release: object, 32-slot vtable and constructor cut verified on this main build (PRs #126 and #304).
+     { "b7f965b9d7227db8e29f04e84ea7331b", "FINAL FANTASY RESONANCE 1.0.1 (Asian release)", UE5_6, 0x77c6210, 0x67df800, 0x137f0 },
++    // Bloodstained: Ritual of the Night 1.60 (Unreal Engine 4.22): FPlatformMemory::BaseAllocator (main+0x5b3a850) mallocs 0x1c28 bytes and calls the constructor (main+0x59f3980, which
++    // reserves 37 GB at main+0x59f4808) from main+0x5b3a868, with the object in x19; its vtable (main+0xc3b8fa0, 18 slots, the 4.22 layout)
++    { "461b14e505ab955525dc93e0e908c0bc", "Bloodstained: Ritual of the Night 1.60", UE4_22, 0, 0xc3b8fa0, 0x5b3a868 },
+ };
+ enum { NSLOT = 32 };
+ 
+@@ -122,8 +129,9 @@ void dm_ue_malloc_install(void) {
+             if (*(uint32_t *)(b + k_ue[k].cut) != 0xd503201f) { LOG("[RED] %s: main is rewritten without the allocator cut (its patches.py): Unreal's own FMallocBinned3 runs", k_ue[k].what); return; }
+             if (!k_ue[k].obj && !gate_obs_present(OBS_UE_MALLOC)) { LOG("[RED] %s: main is rewritten without the allocator gate (OBS of its patches.py): the allocator would have no vtable", k_ue[k].what); return; }
+             memcpy(g_vt, b + k_ue[k].vtable, sizeof g_vt[0] * k_lay[L].nslot);   // the relocated vtable: the trivial slots stay the guest's
+-            g_vt[k_lay[L].malloc_] = (void *)m_Malloc; g_vt[k_lay[L].try_malloc] = (void *)m_TryMalloc; g_vt[k_lay[L].realloc_] = (void *)m_Realloc;
+-            g_vt[k_lay[L].try_realloc] = (void *)m_TryRealloc; g_vt[k_lay[L].free_] = (void *)m_Free;
++            g_vt[k_lay[L].malloc_] = (void *)m_Malloc; g_vt[k_lay[L].realloc_] = (void *)m_Realloc; g_vt[k_lay[L].free_] = (void *)m_Free;
++            if (k_lay[L].try_malloc) g_vt[k_lay[L].try_malloc] = (void *)m_TryMalloc;
++            if (k_lay[L].try_realloc) g_vt[k_lay[L].try_realloc] = (void *)m_TryRealloc;
+             g_vt[k_lay[L].quantize] = (void *)m_QuantizeSize; g_vt[k_lay[L].get_size] = (void *)m_GetAllocationSize;
+             for (int s = 0; s < 6 && k_lay[L].nothing[s]; s++) g_vt[k_lay[L].nothing[s]] = (void *)m_Nothing;
+             g_zone = malloc_create_zone(0, 0); malloc_set_zone_name(g_zone, "guest Unreal heap"); g_what = k_ue[k].what;
+diff --git a/dm/tools/sdk_patches.py b/dm/tools/sdk_patches.py
+index 30ff2c53..250df28f 100644
+--- a/dm/tools/sdk_patches.py
++++ b/dm/tools/sdk_patches.py
+@@ -171,6 +171,14 @@ CUTS = {
+     (0xb1704, 'ea230b32', '0a7ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region orr w10,wzr,#0x3fe00000 → mov w10,#0x3e00000'),
+     (0xb1860, 'ea030232', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more orr w10,wzr,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
+   ],
++  # Bloodstained: Ritual of the Night 1.60 (v851968) sdk: the node area cut, and regions of 1 GB and more aligned to 32 MB, as DRAGON QUEST XI S's SDK 7.3.2 build, whose
++  # AddressRegionManager this is at other offsets (the constructor at sdk+0xc3a70: the limit at +0xc3a80 and the occupied length at +0xc3b20, both orr w9,wzr,#0x3fe00000;
++  # VammManager::AllocateAddressRegion's 1 GB alignment at +0xc3c8c). With Unreal's allocator on the host heap the game maps 0.5 GB at boot, yet reached 3 GB into the alias region without them
++  '6f2805ddeb172a6508922d734bc064e3': [
++    (0xc3a80, 'e9230b32', '097ca052', 'AddressRegionManager constructor: node area limit orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000'),
++    (0xc3b20, 'e9230b32', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000'),
++    (0xc3c8c, 'ea030232', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more orr w10,wzr,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
++  ],
+   # DRAGON QUEST XI S 1.0.4 (v262144) sdk (SDK 7.3.2, the same build as Super Mario Odyssey 1.4.1's, which has no virtual address memory and never allocates an address region): the node
+   # area cut, and regions of 1 GB and more aligned to 32 MB, as Absolum's. Unreal Engine 4.18's nninitStartup takes one region for the whole engine, which a NumberLineAllocator
+   # (main+0x177c4d0) hands out (16 GB by default, -SwitchVirtualAddressSpaceSize= in MB caps it: the profile's game_args); the 1 GB alignment would have put it 1 GB into the alias region.

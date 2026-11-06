@@ -168,20 +168,6 @@ PPtr<Shader>: int m_FileID; SInt64 m_PathID
 PPtr<Texture>: int m_FileID; SInt64 m_PathID
 Shader: string m_Name; SerializedShader m_ParsedForm; vector<data:unsigned int> platforms; vector<data:vector<data:unsigned int>> offsets; vector<data:vector<data:unsigned int>> compressedLengths; vector<data:vector<data:unsigned int>> decompressedLengths; vector<data:UInt8> compressedBlob; vector<data:PPtr<Shader>> m_Dependencies; map<data:pair(string,PPtr<Texture>)>~ m_NonModifiableTextures; bool! m_ShaderIsBaked
 '''
-# The Unity 2021.2 Shader (LEGO Builder's Journey, Unity 2021.2.13f1: every serialized file is stripped and no bundle carries a tree), from Unity 2021.2.13f1's type tree as
-# AssetRipper's TypeTreeDumps records it (StructsDump/release/2021.2.13f1.dump): 2021.2's subprograms drop the local keyword list (as Unity 2022 does), keep their parameters,
-# and the pass carries the serialized keyword state mask. Checked node for node with the flags (2,174 nodes); all 195 Shader objects in the game's files read to their exact ends.
-SHADER_2021_2 = _SHADER_COMMON + '''SerializedSubProgram: unsigned int m_BlobIndex; ParserBindChannels m_Channels; vector<data:UInt16> m_KeywordIndices; SInt8 m_ShaderHardwareTier; SInt8! m_GpuProgramType; SerializedProgramParameters m_Parameters; SInt64 m_ShaderRequirements
-SerializedProgram: vector<data:SerializedSubProgram> m_SubPrograms; SerializedProgramParameters m_CommonParameters
-SerializedPass: vector<data:Hash128> m_EditorDataHash; vector<data:UInt8> m_Platforms; map<data:pair(string,int)>~ m_NameIndices; int m_Type; SerializedShaderState m_State; unsigned int m_ProgramMask; SerializedProgram progVertex; SerializedProgram progFragment; SerializedProgram progGeometry; SerializedProgram progHull; SerializedProgram progDomain; SerializedProgram progRayTracing; bool m_HasInstancingVariant; bool! m_HasProceduralInstancingVariant; string m_UseName; string m_Name; string m_TextureName; SerializedTagMap m_Tags; vector<data:UInt16> m_SerializedKeywordStateMask
-SerializedSubShader: vector<data:SerializedPass> m_Passes; SerializedTagMap m_Tags; int m_LOD
-SerializedShaderDependency: string from; string to
-SerializedCustomEditorForRenderPipeline: string customEditorName; string renderPipelineType
-SerializedShader: SerializedProperties m_PropInfo; vector<data:SerializedSubShader> m_SubShaders; vector<data:string> m_KeywordNames; vector<data:UInt8> m_KeywordFlags; string m_Name; string m_CustomEditorName; string m_FallbackName; vector<data:SerializedShaderDependency> m_Dependencies; vector<data:SerializedCustomEditorForRenderPipeline> m_CustomEditorForRenderPipelines; bool! m_DisableNoSubshadersMessage
-PPtr<Shader>: int m_FileID; SInt64 m_PathID
-PPtr<Texture>: int m_FileID; SInt64 m_PathID
-Shader: string m_Name; SerializedShader m_ParsedForm; vector<data:unsigned int> platforms; vector<data:vector<data:unsigned int>> offsets; vector<data:vector<data:unsigned int>> compressedLengths; vector<data:vector<data:unsigned int>> decompressedLengths; vector<data:UInt8> compressedBlob; vector<data:PPtr<Shader>> m_Dependencies; map<data:pair(string,PPtr<Texture>)>~ m_NonModifiableTextures; bool! m_ShaderIsBaked
-'''
 # The Unity 2018.3 Shader (Raging Loop, Unity 2018.3.10f1: no bundles, its 48 shaders in Data/*.assets and Data/Resources), from Unity 2018.3.10f1's type tree as AssetRipper's TypeTreeDumps
 # records it (StructsDump/release/2018.3.10f1.dump), checked node for node with the flags: older than the common structs above (no conservative raster state, no buffer array sizes, no partial
 # constant buffers), the parameters in each subprogram, one segment per platform (offsets, compressedLengths and decompressedLengths are plain numbers per platform), no local keywords
@@ -220,14 +206,105 @@ Shader: string m_Name; SerializedShader m_ParsedForm; vector<data:unsigned int> 
 SHADER_2017_4 = SHADER_2018_3.replace('bool m_HasInstancingVariant; bool! m_HasProceduralInstancingVariant',
                                       'bool! m_HasInstancingVariant').replace(
     '; map<data:pair(string,PPtr<Texture>)>~ m_NonModifiableTextures', '')
-# The Unity 2019.4 Shader (Dodgeball Academia, Unity 2019.4.21f1: every serialized file is stripped and no bundle carries a tree), from Unity 2019.4.21f1's type tree as AssetRipper's
-# TypeTreeDumps records it (StructsDump/release/2019.4.21f1.dump): the 2018.3 layout with global and local keyword indices per subprogram, a ray tracing program in each pass, and 2019.3's
-# segments (offsets, compressedLengths and decompressedLengths hold one list per platform). Checked node for node with the flags (1,481 nodes), and equal to the tree Subnautica's 2019.4.36f1
-# bundles carry under the same hash; all 62 of Dodgeball Academia's Shader objects read to their exact ends.
-SHADER_2019_4 = SHADER_2018_3.replace('vector<data:UInt16> m_KeywordIndices', 'vector<data:UInt16> m_GlobalKeywordIndices; vector<data:UInt16> m_LocalKeywordIndices').replace(
-    'SerializedProgram progDomain; bool', 'SerializedProgram progDomain; SerializedProgram progRayTracing; bool').replace(
-    'vector<data:unsigned int> offsets; vector<data:unsigned int> compressedLengths; vector<data:unsigned int> decompressedLengths',
-    'vector<data:vector<data:unsigned int>> offsets; vector<data:vector<data:unsigned int>> compressedLengths; vector<data:vector<data:unsigned int>> decompressedLengths')
+# Unity 5.6.4 (WILD GUNS Reloaded, 5.6.4p1: 56 Shaders in Data/Resources and Data/*.assets, none with type trees, and no bundle), written out from AssetRipper's
+# TypeTreeDumps StructsDump/release/5.6.4f1.dump (types, names and alignment flags node for node); every one of the game's Shaders reads to its exact end.
+# Against 2017.4: no zClip, no samplers or shader requirements in a subprogram, no struct parameters in a constant buffer, no multisample flag on a texture,
+# and the vectors' arrays carry no alignment flag (~)
+SHADER_5_6 = '''SerializedTextureProperty: string m_DefaultName; int m_TexDim
+SerializedProperty: string m_Name; string m_Description; vector<data:string>~ m_Attributes; int m_Type; unsigned int m_Flags; float m_DefValue[0]; float m_DefValue[1]; float m_DefValue[2]; float m_DefValue[3]; SerializedTextureProperty m_DefTexture
+SerializedProperties: vector<data:SerializedProperty>~ m_Props
+SerializedShaderFloatValue: float val; string name
+SerializedShaderRTBlendState: SerializedShaderFloatValue srcBlend; SerializedShaderFloatValue destBlend; SerializedShaderFloatValue srcBlendAlpha; SerializedShaderFloatValue destBlendAlpha; SerializedShaderFloatValue blendOp; SerializedShaderFloatValue blendOpAlpha; SerializedShaderFloatValue colMask
+SerializedStencilOp: SerializedShaderFloatValue pass; SerializedShaderFloatValue fail; SerializedShaderFloatValue zFail; SerializedShaderFloatValue comp
+SerializedShaderVectorValue: SerializedShaderFloatValue x; SerializedShaderFloatValue y; SerializedShaderFloatValue z; SerializedShaderFloatValue w; string name
+SerializedTagMap: map<data:pair(string,string)>~ tags
+SerializedShaderState: string m_Name; SerializedShaderRTBlendState rtBlend0; SerializedShaderRTBlendState rtBlend1; SerializedShaderRTBlendState rtBlend2; SerializedShaderRTBlendState rtBlend3; SerializedShaderRTBlendState rtBlend4; SerializedShaderRTBlendState rtBlend5; SerializedShaderRTBlendState rtBlend6; SerializedShaderRTBlendState rtBlend7; bool! rtSeparateBlend; SerializedShaderFloatValue zTest; SerializedShaderFloatValue zWrite; SerializedShaderFloatValue culling; SerializedShaderFloatValue offsetFactor; SerializedShaderFloatValue offsetUnits; SerializedShaderFloatValue alphaToMask; SerializedStencilOp stencilOp; SerializedStencilOp stencilOpFront; SerializedStencilOp stencilOpBack; SerializedShaderFloatValue stencilReadMask; SerializedShaderFloatValue stencilWriteMask; SerializedShaderFloatValue stencilRef; SerializedShaderFloatValue fogStart; SerializedShaderFloatValue fogEnd; SerializedShaderFloatValue fogDensity; SerializedShaderVectorValue fogColor; int fogMode; int gpuProgramID; SerializedTagMap m_Tags; int m_LOD; bool! lighting
+ShaderBindChannel: SInt8 source; SInt8 target
+ParserBindChannels: vector<data:ShaderBindChannel>~! m_Channels; int m_SourceMap
+VectorParameter: int m_NameIndex; int m_Index; int m_ArraySize; SInt8 m_Type; SInt8! m_Dim
+MatrixParameter: int m_NameIndex; int m_Index; int m_ArraySize; SInt8 m_Type; SInt8! m_RowCount
+TextureParameter: int m_NameIndex; int m_Index; int m_SamplerIndex; SInt8! m_Dim
+BufferBinding: int m_NameIndex; int m_Index
+ConstantBuffer: int m_NameIndex; vector<data:MatrixParameter>~ m_MatrixParams; vector<data:VectorParameter>~ m_VectorParams; int m_Size
+UAVParameter: int m_NameIndex; int m_Index; int m_OriginalIndex
+SerializedSubProgram: unsigned int m_BlobIndex; ParserBindChannels m_Channels; vector<data:UInt16>~ m_KeywordIndices; SInt8 m_ShaderHardwareTier; SInt8! m_GpuProgramType; vector<data:VectorParameter>~ m_VectorParams; vector<data:MatrixParameter>~ m_MatrixParams; vector<data:TextureParameter>~ m_TextureParams; vector<data:BufferBinding>~ m_BufferParams; vector<data:ConstantBuffer>~ m_ConstantBuffers; vector<data:BufferBinding>~ m_ConstantBufferBindings; vector<data:UAVParameter>~ m_UAVParams
+SerializedProgram: vector<data:SerializedSubProgram>~ m_SubPrograms
+SerializedPass: map<data:pair(string,int)>~ m_NameIndices; int m_Type; SerializedShaderState m_State; unsigned int m_ProgramMask; SerializedProgram progVertex; SerializedProgram progFragment; SerializedProgram progGeometry; SerializedProgram progHull; SerializedProgram progDomain; bool! m_HasInstancingVariant; string m_UseName; string m_Name; string m_TextureName; SerializedTagMap m_Tags
+SerializedSubShader: vector<data:SerializedPass>~ m_Passes; SerializedTagMap m_Tags; int m_LOD
+SerializedShaderDependency: string from; string to
+SerializedShader: SerializedProperties m_PropInfo; vector<data:SerializedSubShader>~ m_SubShaders; string m_Name; string m_CustomEditorName; string m_FallbackName; vector<data:SerializedShaderDependency>~ m_Dependencies; bool! m_DisableNoSubshadersMessage
+PPtr<Shader>: int m_FileID; SInt64 m_PathID
+Shader: string m_Name; SerializedShader m_ParsedForm; vector<data:unsigned int>~ platforms; vector<data:unsigned int>~ offsets; vector<data:unsigned int>~ compressedLengths; vector<data:unsigned int>~ decompressedLengths; vector<data:UInt8> compressedBlob; vector<data:PPtr<Shader>>~ m_Dependencies; bool! m_ShaderIsBaked
+'''
+# Unity 2021.2 (Xiaomei and the Flame Dragon's Fist, 2021.2.0b16: 57 Shaders in Data/Resources and Data/*.assets, none with type trees, and no bundle), written out from AssetRipper's
+# TypeTreeDumps StructsDump/release/2021.2.0f1.dump (types, names and alignment flags node for node); every one of the game's Shaders reads to its exact end, and 2021.3.18f1's tree does not.
+# Against 2020.3: one keyword index list and a 64-bit m_ShaderRequirements in a subprogram, m_SerializedKeywordStateMask in a pass, and the keyword names and flags in the parsed form;
+# against 2022.3: no m_PlayerSubPrograms or m_ParameterBlobIndices (each blob entry is a program code) and no stageCounts
+SHADER_2021_2 = '''SerializedTextureProperty: string m_DefaultName; int m_TexDim
+SerializedProperty: string m_Name; string m_Description; vector<data:string> m_Attributes; int m_Type; unsigned int m_Flags; float m_DefValue[0]; float m_DefValue[1]; float m_DefValue[2]; float m_DefValue[3]; SerializedTextureProperty m_DefTexture
+SerializedProperties: vector<data:SerializedProperty> m_Props
+Hash128: UInt8 bytes[0]; UInt8 bytes[1]; UInt8 bytes[2]; UInt8 bytes[3]; UInt8 bytes[4]; UInt8 bytes[5]; UInt8 bytes[6]; UInt8 bytes[7]; UInt8 bytes[8]; UInt8 bytes[9]; UInt8 bytes[10]; UInt8 bytes[11]; UInt8 bytes[12]; UInt8 bytes[13]; UInt8 bytes[14]; UInt8 bytes[15]
+SerializedShaderFloatValue: float val; string name
+SerializedShaderRTBlendState: SerializedShaderFloatValue srcBlend; SerializedShaderFloatValue destBlend; SerializedShaderFloatValue srcBlendAlpha; SerializedShaderFloatValue destBlendAlpha; SerializedShaderFloatValue blendOp; SerializedShaderFloatValue blendOpAlpha; SerializedShaderFloatValue colMask
+SerializedStencilOp: SerializedShaderFloatValue pass; SerializedShaderFloatValue fail; SerializedShaderFloatValue zFail; SerializedShaderFloatValue comp
+SerializedShaderVectorValue: SerializedShaderFloatValue x; SerializedShaderFloatValue y; SerializedShaderFloatValue z; SerializedShaderFloatValue w; string name
+SerializedTagMap: map<data:pair(string,string)>~ tags
+SerializedShaderState: string m_Name; SerializedShaderRTBlendState rtBlend0; SerializedShaderRTBlendState rtBlend1; SerializedShaderRTBlendState rtBlend2; SerializedShaderRTBlendState rtBlend3; SerializedShaderRTBlendState rtBlend4; SerializedShaderRTBlendState rtBlend5; SerializedShaderRTBlendState rtBlend6; SerializedShaderRTBlendState rtBlend7; bool! rtSeparateBlend; SerializedShaderFloatValue zClip; SerializedShaderFloatValue zTest; SerializedShaderFloatValue zWrite; SerializedShaderFloatValue culling; SerializedShaderFloatValue conservative; SerializedShaderFloatValue offsetFactor; SerializedShaderFloatValue offsetUnits; SerializedShaderFloatValue alphaToMask; SerializedStencilOp stencilOp; SerializedStencilOp stencilOpFront; SerializedStencilOp stencilOpBack; SerializedShaderFloatValue stencilReadMask; SerializedShaderFloatValue stencilWriteMask; SerializedShaderFloatValue stencilRef; SerializedShaderFloatValue fogStart; SerializedShaderFloatValue fogEnd; SerializedShaderFloatValue fogDensity; SerializedShaderVectorValue fogColor; int fogMode; int gpuProgramID; SerializedTagMap m_Tags; int m_LOD; bool! lighting
+ShaderBindChannel: SInt8 source; SInt8 target
+ParserBindChannels: vector<data:ShaderBindChannel>! m_Channels; int m_SourceMap
+VectorParameter: int m_NameIndex; int m_Index; int m_ArraySize; SInt8 m_Type; SInt8! m_Dim
+MatrixParameter: int m_NameIndex; int m_Index; int m_ArraySize; SInt8 m_Type; SInt8! m_RowCount
+TextureParameter: int m_NameIndex; int m_Index; int m_SamplerIndex; bool m_MultiSampled; SInt8! m_Dim
+BufferBinding: int m_NameIndex; int m_Index; int m_ArraySize
+StructParameter: int m_NameIndex; int m_Index; int m_ArraySize; int m_StructSize; vector<data:VectorParameter> m_VectorMembers; vector<data:MatrixParameter> m_MatrixMembers
+ConstantBuffer: int m_NameIndex; vector<data:MatrixParameter> m_MatrixParams; vector<data:VectorParameter> m_VectorParams; vector<data:StructParameter> m_StructParams; int m_Size; bool! m_IsPartialCB
+UAVParameter: int m_NameIndex; int m_Index; int m_OriginalIndex
+SamplerParameter: unsigned int sampler; int bindPoint
+SerializedProgramParameters: vector<data:VectorParameter> m_VectorParams; vector<data:MatrixParameter> m_MatrixParams; vector<data:TextureParameter> m_TextureParams; vector<data:BufferBinding> m_BufferParams; vector<data:ConstantBuffer> m_ConstantBuffers; vector<data:BufferBinding> m_ConstantBufferBindings; vector<data:UAVParameter> m_UAVParams; vector<data:SamplerParameter> m_Samplers
+SerializedSubProgram: unsigned int m_BlobIndex; ParserBindChannels m_Channels; vector<data:UInt16> m_KeywordIndices; SInt8 m_ShaderHardwareTier; SInt8! m_GpuProgramType; SerializedProgramParameters m_Parameters; SInt64 m_ShaderRequirements
+SerializedProgram: vector<data:SerializedSubProgram> m_SubPrograms; SerializedProgramParameters m_CommonParameters
+SerializedPass: vector<data:Hash128> m_EditorDataHash; vector<data:UInt8> m_Platforms; map<data:pair(string,int)>~ m_NameIndices; int m_Type; SerializedShaderState m_State; unsigned int m_ProgramMask; SerializedProgram progVertex; SerializedProgram progFragment; SerializedProgram progGeometry; SerializedProgram progHull; SerializedProgram progDomain; SerializedProgram progRayTracing; bool m_HasInstancingVariant; bool! m_HasProceduralInstancingVariant; string m_UseName; string m_Name; string m_TextureName; SerializedTagMap m_Tags; vector<data:UInt16> m_SerializedKeywordStateMask
+SerializedSubShader: vector<data:SerializedPass> m_Passes; SerializedTagMap m_Tags; int m_LOD
+SerializedShaderDependency: string from; string to
+SerializedCustomEditorForRenderPipeline: string customEditorName; string renderPipelineType
+SerializedShader: SerializedProperties m_PropInfo; vector<data:SerializedSubShader> m_SubShaders; vector<data:string> m_KeywordNames; vector<data:UInt8> m_KeywordFlags; string m_Name; string m_CustomEditorName; string m_FallbackName; vector<data:SerializedShaderDependency> m_Dependencies; vector<data:SerializedCustomEditorForRenderPipeline> m_CustomEditorForRenderPipelines; bool! m_DisableNoSubshadersMessage
+PPtr<Shader>: int m_FileID; SInt64 m_PathID
+PPtr<Texture>: int m_FileID; SInt64 m_PathID
+Shader: string m_Name; SerializedShader m_ParsedForm; vector<data:unsigned int> platforms; vector<data:vector<data:unsigned int>> offsets; vector<data:vector<data:unsigned int>> compressedLengths; vector<data:vector<data:unsigned int>> decompressedLengths; vector<data:UInt8> compressedBlob; vector<data:PPtr<Shader>> m_Dependencies; map<data:pair(string,PPtr<Texture>)>~ m_NonModifiableTextures; bool! m_ShaderIsBaked
+'''
+# Unity 2019.4 (SOL CRESTA, 2019.4.31f1: 79 Shaders in Data/Resources and Data/*.assets, none with type trees; its StreamingAssets bundles are PS4 and Windows ones), written out from AssetRipper's
+# TypeTreeDumps StructsDump/release/2019.4.31f1.dump (types, names and alignment flags node for node); every one of the game's Shaders reads to its exact end.
+# Against 2018.3: per-segment offsets and lengths (vectors of vectors), global and local keyword index lists, and a ray tracing program in each pass;
+# against 2020.3: the parameters still sit in each subprogram (no SerializedProgramParameters), and no conservative state, keyword masks or editor hashes in a pass
+SHADER_2019_4 = '''SerializedTextureProperty: string m_DefaultName; int m_TexDim
+SerializedProperty: string m_Name; string m_Description; vector<data:string> m_Attributes; int m_Type; unsigned int m_Flags; float m_DefValue[0]; float m_DefValue[1]; float m_DefValue[2]; float m_DefValue[3]; SerializedTextureProperty m_DefTexture
+SerializedProperties: vector<data:SerializedProperty> m_Props
+SerializedShaderFloatValue: float val; string name
+SerializedShaderRTBlendState: SerializedShaderFloatValue srcBlend; SerializedShaderFloatValue destBlend; SerializedShaderFloatValue srcBlendAlpha; SerializedShaderFloatValue destBlendAlpha; SerializedShaderFloatValue blendOp; SerializedShaderFloatValue blendOpAlpha; SerializedShaderFloatValue colMask
+SerializedStencilOp: SerializedShaderFloatValue pass; SerializedShaderFloatValue fail; SerializedShaderFloatValue zFail; SerializedShaderFloatValue comp
+SerializedShaderVectorValue: SerializedShaderFloatValue x; SerializedShaderFloatValue y; SerializedShaderFloatValue z; SerializedShaderFloatValue w; string name
+SerializedTagMap: map<data:pair(string,string)>~ tags
+SerializedShaderState: string m_Name; SerializedShaderRTBlendState rtBlend0; SerializedShaderRTBlendState rtBlend1; SerializedShaderRTBlendState rtBlend2; SerializedShaderRTBlendState rtBlend3; SerializedShaderRTBlendState rtBlend4; SerializedShaderRTBlendState rtBlend5; SerializedShaderRTBlendState rtBlend6; SerializedShaderRTBlendState rtBlend7; bool! rtSeparateBlend; SerializedShaderFloatValue zClip; SerializedShaderFloatValue zTest; SerializedShaderFloatValue zWrite; SerializedShaderFloatValue culling; SerializedShaderFloatValue offsetFactor; SerializedShaderFloatValue offsetUnits; SerializedShaderFloatValue alphaToMask; SerializedStencilOp stencilOp; SerializedStencilOp stencilOpFront; SerializedStencilOp stencilOpBack; SerializedShaderFloatValue stencilReadMask; SerializedShaderFloatValue stencilWriteMask; SerializedShaderFloatValue stencilRef; SerializedShaderFloatValue fogStart; SerializedShaderFloatValue fogEnd; SerializedShaderFloatValue fogDensity; SerializedShaderVectorValue fogColor; int fogMode; int gpuProgramID; SerializedTagMap m_Tags; int m_LOD; bool! lighting
+ShaderBindChannel: SInt8 source; SInt8 target
+ParserBindChannels: vector<data:ShaderBindChannel>! m_Channels; int m_SourceMap
+VectorParameter: int m_NameIndex; int m_Index; int m_ArraySize; SInt8 m_Type; SInt8! m_Dim
+MatrixParameter: int m_NameIndex; int m_Index; int m_ArraySize; SInt8 m_Type; SInt8! m_RowCount
+TextureParameter: int m_NameIndex; int m_Index; int m_SamplerIndex; bool m_MultiSampled; SInt8! m_Dim
+BufferBinding: int m_NameIndex; int m_Index
+StructParameter: int m_NameIndex; int m_Index; int m_ArraySize; int m_StructSize; vector<data:VectorParameter> m_VectorMembers; vector<data:MatrixParameter> m_MatrixMembers
+ConstantBuffer: int m_NameIndex; vector<data:MatrixParameter> m_MatrixParams; vector<data:VectorParameter> m_VectorParams; vector<data:StructParameter> m_StructParams; int m_Size
+UAVParameter: int m_NameIndex; int m_Index; int m_OriginalIndex
+SamplerParameter: unsigned int sampler; int bindPoint
+SerializedSubProgram: unsigned int m_BlobIndex; ParserBindChannels m_Channels; vector<data:UInt16> m_GlobalKeywordIndices; vector<data:UInt16> m_LocalKeywordIndices; SInt8 m_ShaderHardwareTier; SInt8! m_GpuProgramType; vector<data:VectorParameter> m_VectorParams; vector<data:MatrixParameter> m_MatrixParams; vector<data:TextureParameter> m_TextureParams; vector<data:BufferBinding> m_BufferParams; vector<data:ConstantBuffer> m_ConstantBuffers; vector<data:BufferBinding> m_ConstantBufferBindings; vector<data:UAVParameter> m_UAVParams; vector<data:SamplerParameter> m_Samplers; int m_ShaderRequirements
+SerializedProgram: vector<data:SerializedSubProgram> m_SubPrograms
+SerializedPass: map<data:pair(string,int)>~ m_NameIndices; int m_Type; SerializedShaderState m_State; unsigned int m_ProgramMask; SerializedProgram progVertex; SerializedProgram progFragment; SerializedProgram progGeometry; SerializedProgram progHull; SerializedProgram progDomain; SerializedProgram progRayTracing; bool m_HasInstancingVariant; bool! m_HasProceduralInstancingVariant; string m_UseName; string m_Name; string m_TextureName; SerializedTagMap m_Tags
+SerializedSubShader: vector<data:SerializedPass> m_Passes; SerializedTagMap m_Tags; int m_LOD
+SerializedShaderDependency: string from; string to
+SerializedShader: SerializedProperties m_PropInfo; vector<data:SerializedSubShader> m_SubShaders; string m_Name; string m_CustomEditorName; string m_FallbackName; vector<data:SerializedShaderDependency> m_Dependencies; bool! m_DisableNoSubshadersMessage
+PPtr<Shader>: int m_FileID; SInt64 m_PathID
+PPtr<Texture>: int m_FileID; SInt64 m_PathID
+Shader: string m_Name; SerializedShader m_ParsedForm; vector<data:unsigned int> platforms; vector<data:vector<data:unsigned int>> offsets; vector<data:vector<data:unsigned int>> compressedLengths; vector<data:vector<data:unsigned int>> decompressedLengths; vector<data:UInt8> compressedBlob; vector<data:PPtr<Shader>> m_Dependencies; map<data:pair(string,PPtr<Texture>)>~ m_NonModifiableTextures; bool! m_ShaderIsBaked
+'''
 # The Unity 2022.3 ComputeShader (Monster Train 2, Unity 2022.3.54f1: 12 in Data/sharedassets2.assets, which carries no type trees, and no bundle has one), from Unity 2022.3.54f1's type tree
 # as AssetRipper's TypeTreeDumps records it (StructsDump/release/2022.3.54f1.dump). Each kernel variant's code is a program code of one stage, compute (the layout of a Shader's subprogram code)
 COMPUTE_2022_3 = '''ComputeShaderResource: string name; string generatedName; int bindPoint; int samplerBindPoint; int texDimension
@@ -264,12 +341,13 @@ COMPUTE_2017_4 = COMPUTE_2019_4.replace('int samplerBindPoint; int texDimension'
     'ComputeBufferCounter: int bindpoint; int offset\n'
 CLASS_COMPUTE_SHADER = 72
 KNOWN_TREES = {(CLASS_SHADER, bytes.fromhex('ea424a5fc1e48db62144df956f9e1005')): ('Shader', SHADER_2022_3),
-               (CLASS_SHADER, bytes.fromhex('d8236c9bd87d85edb203acf352348124')): ('Shader', SHADER_2021_2),
                (CLASS_SHADER, bytes.fromhex('2ec7223dce3af4232b14ae1441bd7999')): ('Shader', SHADER_6000_0),
                (CLASS_SHADER, bytes.fromhex('a30e3dcf6c6d25153d6f64e5e41caf4e')): ('Shader', SHADER_2020_3),
-               (CLASS_SHADER, bytes.fromhex('ed2a06ce7fb8203f6efb5ab5e0ce20d5')): ('Shader', SHADER_2019_4),
                (CLASS_SHADER, bytes.fromhex('8db760073e1392061e4a36995f0735af')): ('Shader', SHADER_2018_3),
                (CLASS_SHADER, bytes.fromhex('266d53113fa30d2b858f2768f92eaa14')): ('Shader', SHADER_2017_4),
+               (CLASS_SHADER, bytes.fromhex('a70f7abc6586fb35b3a0641aa81e9375')): ('Shader', SHADER_5_6),
+               (CLASS_SHADER, bytes.fromhex('d8236c9bd87d85edb203acf352348124')): ('Shader', SHADER_2021_2),
+               (CLASS_SHADER, bytes.fromhex('ed2a06ce7fb8203f6efb5ab5e0ce20d5')): ('Shader', SHADER_2019_4),
                (CLASS_COMPUTE_SHADER, bytes.fromhex('bfdf63ab0ce84d5a2c765ee560d90fe7')): ('ComputeShader', COMPUTE_2022_3),
                (CLASS_COMPUTE_SHADER, bytes.fromhex('abd9135b8ce83d043fef4e9ec7f53366')): ('ComputeShader', COMPUTE_2021_3),
                (CLASS_COMPUTE_SHADER, bytes.fromhex('1a95529ac2eb1a97cd9d2a4356bd722f')): ('ComputeShader', COMPUTE_2019_4),

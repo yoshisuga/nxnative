@@ -2,4 +2,3 @@ t_tex
 t_fmt_mtl
 *.dSYM
 asan/
-cov/

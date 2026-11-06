@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoshi Sugawara <yoshi.sugawara@gmail.com>
+Date: Thu, 29 Oct 2026 08:27:01 -1000
+Subject: [PATCH] audren, sdk cuts: SDK 5.3 (Bloodstained: Ritual of the Night
+ 1.0)
+
+The renderer signals the event the handle names, which Unreal destroys right after
+opening: switch to a host-owned event once the game's is unbound. Read SDK 5.3's
+DeviceSink (0x138 bytes, s16 input indices). Add the AddressRegionManager node area
+and 1 GB alignment cuts for the SDK 5.3 sdk build.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: SDK 5.3 (Bloodstained: Ritual of the Night 1.0): the audio renderer aborted on a destroyed event and had no DeviceSink; its 16 GB engine region started 1.75 GB into the alias region
+Issue: none yet (Bloodstained: Ritual of the Night bring-up)
+
+---
+ dm/host/hle_audren.c    | 25 +++++++++++++++++++------
+ dm/tools/sdk_patches.py |  9 +++++++++
+ 2 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/dm/host/hle_audren.c b/dm/host/hle_audren.c
+index 9dbae56c..a4e6fa54 100644
+--- a/dm/host/hle_audren.c
++++ b/dm/host/hle_audren.c
+@@ -84,6 +84,7 @@ HLE_FORCE("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererPar
+ }
+ // ---------- rendering and output ----------
+ static void *g_handle[2];                    // AudioRendererHandle (renderer object, client state)
++static void *g_ev_game;                      // the game's renderer event when the handle names it (SDK 5.3), until the game destroys it (render_main)
+ static _Atomic int g_open;
+ static void *g_render_tt;                    // the render thread (ThreadType from dm_guest_thread_spawn): Close joins it before the SDK tears the renderer down
+ static int16_t g_frame[FRAME_MAX * 2]; static int g_frame_n;   // the latest frame (stereo int16)
+@@ -112,7 +113,16 @@ static void render_main(void *arg) {
+         const int16_t *src; int got;
+         uint32_t h = atomic_load(&g_cq_head);
+         if (h != atomic_load(&g_cq_tail)) { src = g_cq[h % CQ]; got = g_cq_n[h % CQ]; atomic_store(&g_cq_head, h + 1); cq_popped(); }   // play queued catch-up output first
+-        else { g_frame_n = 0; exec(g_handle[0], g_handle[1]); src = g_frame; got = g_frame_n; }   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event
++        else {
++            // SDK 5.3's ExecuteAudioRendererRendering signals the event the handle names (handle[1] = ev, sdk+0x224f18). Unreal (Bloodstained: Ritual of the Night 1.0) opens the renderer
++            // with a SystemEvent on its stack, which it destroys on return: with the DSP service it never renders by hand, so on hardware nothing signals that event again. Here the next
++            // render signalled freed memory (SignalSystemEvent's state assertion), or the closed kernel event. Once the game's event is no longer bound, the renderer signals one of its own
++            if (g_ev_game && !hle_system_event_binding(g_ev_game)) {
++                static uint8_t own[0x40] __attribute__((aligned(16)));
++                hle_bind_system_event(own, 1); g_handle[1] = own; g_ev_game = NULL;
++                LOG("audren: the game destroyed the renderer event it opened with; the renderer signals an event of its own");
++            }
++            g_frame_n = 0; exec(g_handle[0], g_handle[1]); src = g_frame; got = g_frame_n; }   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event
+         int n = got ? got : 240;
+         gbuf *b = free_list[--nfree];
+         if (got) memcpy(b->ptr, src, (size_t)n * 4); else memset(b->ptr, 0, (size_t)n * 4);
+@@ -166,7 +176,9 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
+         destroy(ev); hle_bind_system_event(ev, 1);
+     }
+     if (atomic_load(&g_open)) { LOG("[RED] audren: a second renderer (the host drives only one)"); return r; }
+-    g_handle[0] = handle[0]; g_handle[1] = handle[1]; atomic_store(&g_open, 1);
++    g_handle[0] = handle[0]; g_handle[1] = handle[1];
++    g_ev_game = ev && handle[1] == ev ? ev : NULL;
++    atomic_store(&g_open, 1);
+     g_render_tt = dm_guest_thread_spawn(render_main, NULL, 9, 0x10000);
+     return r;
+ }
+@@ -196,6 +208,7 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close
+ //   indices. Walked as SDK 20, the first command's enabled / ID / size bytes read as a magic of 0x181901 and the game was silent. With no magic, that walk must stay inside the generated list
+ // SDK 4.4.0 (Mario Kart 8 Deluxe, GenerateDeviceSinkCommand at sdk+0x19e690) has the SDK 6 header, and its DeviceSink is ID 0xf and 0x130 bytes: +0x14 device name, +0x118 upsample buffer,
+ //   +0x120 input count, +0x124 input indices as bytes (s8). No 0x148-byte command, so the first full command list's one 0x130-byte command with 1 to 6 inputs is the sink (g_sink4)
++// SDK 5.3 (Bloodstained: Ritual of the Night 1.0) has the same fields with the input indices as s16, so its DeviceSink (ID 0xf) is 0x138 bytes (g_sink4 = 2)
+ static int g_sink_id = 0x13, g_hdr6, g_hdr21, g_sink4;
+ // Probing the wrong layout can advance by an unaligned size: decode wire fields without typed loads.
+ static int cmd_size(const uint8_t *q) { int16_t n; memcpy(&n, q + (g_hdr21 ? 2 : g_hdr6 ? 4 : 6), sizeof n); return n; }
+@@ -265,17 +278,17 @@ static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
+     if (!layout_done) return 0;
+     if (!hist_logged && ncmd > 4) {   // first full command list: command ID histogram and the sink ID check
+         hist_logged = 1;
+-        int hist[64] = {0}, cand = -1, ncand = 0, cand4 = -1, ncand4 = 0, sink_sz = 0x148 + sink_body(); const uint8_t *q = cl + 0x20; char line[512]; size_t o = 0;
++        int hist[64] = {0}, cand = -1, ncand = 0, cand4 = -1, ncand4 = 0, sink5 = 0, sink_sz = 0x148 + sink_body(); const uint8_t *q = cl + 0x20; char line[512]; size_t o = 0;
+         for (uint32_t i = 0; i < ncmd && cmd_ok(q, cend); i++) {
+             int sz = cmd_size(q); hist[cmd_id(q) & 63]++;
+             if (sz == sink_sz && *(const uint32_t *)(q + 0x130 + sink_body()) - 1 < 6) { cand = cmd_id(q); ncand++; }
+-            if (g_hdr6 && sz == 0x130 && *(const uint32_t *)(q + 0x120) - 1 < 6) { cand4 = cmd_id(q); ncand4++; }
++            if (g_hdr6 && (sz == 0x130 || sz == 0x138) && *(const uint32_t *)(q + 0x120) - 1 < 6) { cand4 = cmd_id(q); ncand4++; sink5 = sz == 0x138; }
+             q += sz;
+         }
+         for (int k = 0; k < 64; k++) if (hist[k]) o += snprintf(line + o, sizeof line - o, " %d×%d", k, hist[k]);
+         LOG("audren: first-frame commands %u, by command ID: %s", ncmd, line);
+         if (!hist[g_sink_id & 63] && ncand == 1) { LOG("audren: no command with ID %#x in the command list; the only 0x148-byte command is ID %#x, taking it as DeviceSink", g_sink_id, cand); g_sink_id = cand; }
+-        else if (!hist[g_sink_id & 63] && !ncand && ncand4 == 1) { LOG("audren: no command with ID %#x in the command list; the only 0x130-byte command is ID %#x, taking it as the SDK 4 DeviceSink", g_sink_id, cand4); g_sink_id = cand4; g_sink4 = 1; }
++        else if (!hist[g_sink_id & 63] && !ncand && ncand4 == 1) { LOG("audren: no command with ID %#x in the command list; the only %#x-byte command is ID %#x, taking it as the SDK %d DeviceSink", g_sink_id, sink5 ? 0x138 : 0x130, cand4, sink5 ? 5 : 4); g_sink_id = cand4; g_sink4 = 1 + sink5; }
+         else if (!hist[g_sink_id & 63]) LOG("[RED] audren: no DeviceSink (ID %#x) in the command list, %d commands of %#x bytes: the game will have no sound", g_sink_id, ncand, sink_sz);
+     }
+     const uint8_t *c = cl + 0x20;
+@@ -285,7 +298,7 @@ static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
+         if (cmd_id(c) == g_sink_id && cmd_on(c)) {
+             const uint8_t *b = c + sink_body();
+             uint32_t nin = *(const uint32_t *)(b + (g_sink4 ? 0x120 : 0x130)); int16_t in[6];
+-            for (uint32_t j = 0; j < 6; j++) in[j] = g_sink4 ? ((const int8_t *)(b + 0x124))[j] : ((const int16_t *)(b + 0x134))[j];
++            for (uint32_t j = 0; j < 6; j++) in[j] = g_sink4 == 1 ? ((const int8_t *)(b + 0x124))[j] : ((const int16_t *)(b + (g_sink4 ? 0x124 : 0x134)))[j];
+             const int32_t *up = *(const int32_t *const *)(b + (g_sink4 ? 0x118 : 0x128));
+             if (!logged++) LOG("audren: DeviceSink inputs %u (%d %d …) rate %u samples per frame %u mix buffer %p upsample buffer %p%s", nin, nin ? in[0] : -1, nin > 1 ? in[1] : -1, rate, samples, (void *)mix, (void *)up,
+                                rate == 32000 ? " (32 kHz: resampled to 48 kHz on the host)" : "");
+diff --git a/dm/tools/sdk_patches.py b/dm/tools/sdk_patches.py
+index 6fb0036e..30ff2c53 100644
+--- a/dm/tools/sdk_patches.py
++++ b/dm/tools/sdk_patches.py
+@@ -162,6 +162,15 @@ CUTS = {
+     (0x1423fc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+     (0x142468, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+   ],
++  # Bloodstained: Ritual of the Night 1.0 (v0) sdk (SDK 5.3): the node area cut, and regions of 1 GB and more aligned to 32 MB, as DRAGON QUEST XI S's SDK 7.3.2 build, whose
++  # AddressRegionManager this is at other offsets. Its Unreal Engine 4.18 takes one 16 GB region for the engine as DRAGON QUEST XI S's (game_args caps it); without the cuts it started
++  # 1.75 GB into the alias region (measured with a 64 GB one). The constructor is at sdk+0xb1650 (the limit at +0xb1668 from orr w9,wzr,#0x3fe00000, the occupied length at +0xb1704 from
++  # orr w10,wzr,#0x3fe00000); VammManager::AllocateAddressRegion aligns a region by its size (+0xb1860)
++  '2871b9db62524ed042cb2018f618c715': [
++    (0xb1668, 'e9230b32', '097ca052', 'AddressRegionManager constructor: node area limit orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000'),
++    (0xb1704, 'ea230b32', '0a7ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region orr w10,wzr,#0x3fe00000 → mov w10,#0x3e00000'),
++    (0xb1860, 'ea030232', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more orr w10,wzr,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
++  ],
+   # DRAGON QUEST XI S 1.0.4 (v262144) sdk (SDK 7.3.2, the same build as Super Mario Odyssey 1.4.1's, which has no virtual address memory and never allocates an address region): the node
+   # area cut, and regions of 1 GB and more aligned to 32 MB, as Absolum's. Unreal Engine 4.18's nninitStartup takes one region for the whole engine, which a NumberLineAllocator
+   # (main+0x177c4d0) hands out (16 GB by default, -SwitchVirtualAddressSpaceSize= in MB caps it: the profile's game_args); the 1 GB alignment would have put it 1 GB into the alias region.

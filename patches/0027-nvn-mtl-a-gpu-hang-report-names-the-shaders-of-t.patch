@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoshi Sugawara <yoshi.sugawara@gmail.com>
+Date: Wed, 28 Oct 2026 09:06:01 -1000
+Subject: [PATCH] nvn-mtl: a GPU hang report names the shaders of the command
+ buffer that hung
+
+iOS only reports "Caused GPU Hang Error" and then ignores every later
+submission. Each command buffer (submission or segment) now records the
+shader keys of its draws and dispatches, and logs them (at most 6 reports)
+when the GPU says it hung or was killed as a victim of a hang.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: DRAGON QUEST XI S JP (010054A0085CA000) bring-up on iOS: see the commit message
+Issue: none yet (local bring-up of DRAGON QUEST XI S JP, 010054A0085CA000)
+
+---
+ dm/gfx/nvn/nvn_mtl.m | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 5568f08..db5a496 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -1461,6 +1461,37 @@ static void post_complete(uint64_t fence, uint64_t c0, uint64_t c1) {
+     }
+     pthread_mutex_lock(&g_mu); if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+ }
++// GPU hang report: the shaders each command buffer (a submission or one of its segments, sub_cut) used, logged when the GPU reports that buffer hung or killed as a victim of a hang.
++// iOS only says "Caused GPU Hang Error" and then ignores every later submission (a black screen for good); the keys name the candidates (DRAGON QUEST XI S: the first frame after a cutscene
++// movie, 010054A0085CA000). Recorded on the replay thread at each draw and dispatch, deduplicated per buffer; costs a short scan per draw
++#define HK_MAX 768
++typedef struct { int n, lost; uint64_t pass0, pass1, frame; char k[HK_MAX][26]; } hk_set;
++static hk_set *g_hk;
++static void hk_note(const char *key, char stage) {
++    if (!key) return;
++    if (!g_hk) { g_hk = calloc(1, sizeof *g_hk); if (!g_hk) return; g_hk->pass0 = g_stat_pass; g_hk->frame = atomic_load(&g_cur_frame); }
++    for (int i = g_hk->n - 1; i >= 0; i--) if (g_hk->k[i][0] == stage && !strcmp(g_hk->k[i] + 1, key)) return;
++    if (g_hk->n == HK_MAX) { g_hk->lost++; return; }
++    g_hk->k[g_hk->n][0] = stage; strlcpy(g_hk->k[g_hk->n] + 1, key, sizeof g_hk->k[0] - 1); g_hk->n++;
++}
++static hk_set *hk_take(void) { hk_set *h = g_hk; g_hk = NULL; if (h) h->pass1 = g_stat_pass; return h; }
++// In the feedback handler: report the set when the error is the hang itself or a victim of one ("Ignored" submissions after it are not reported), then free it
++static void hk_done(hk_set *h, NSError *err, const char *what) {
++    if (!h) return;
++    NSString *d = err.description;
++    int hang = err && [d containsString:@"Hang"], victim = err && [d containsString:@"Victim"];
++    static _Atomic int reports;
++    if ((hang || victim) && atomic_fetch_add(&reports, 1) < 6) {
++        MLOG("[RED] GPU hang report: %s command buffer %s, frame %llu passes %llu–%llu, %d shaders%s (v vertex, f fragment, g geometry, t tessellation, c compute):", what, hang ? "that hung" : "killed as a victim of a hang",
++             (unsigned long long)h->frame, (unsigned long long)h->pass0 + 1, (unsigned long long)h->pass1, h->n, h->lost ? " (more not recorded)" : "");
++        char line[1024]; int o = 0;
++        for (int i = 0; i < h->n; i++) {
++            o += snprintf(line + o, sizeof line - o, "%s%c:%s", o ? " " : "", h->k[i][0], h->k[i] + 1);
++            if (o > 900 || i == h->n - 1) { MLOG("[RED] GPU hang report:   %s", line); o = 0; }
++        }
++    }
++    free(h);
++}
+ uint64_t mtl_sub_commit(void) {
+     lc_land();   // clears still waiting (the command list ends with them)
+     defer_fallback();   // Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
+@@ -1482,6 +1513,7 @@ uint64_t mtl_sub_commit(void) {
+     uint64_t gpu_f = atomic_load(&g_cur_frame); gpu_tag_begin(gpu_f);
+     NSString *cctx = @(cctx_snap());
+     seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL;
++    hk_set *hk = hk_take();
+     pthread_mutex_lock(&g_post_mu);
+     if (!atomic_load(&pr->claimed) && pr->fence) MDIE("post ring: the writes of fence %llu never ran", (unsigned long long)pr->fence);
+     pr->n = n; pr->ops = ops; pr->sc = sc; pr->seg_last = seg_last; pr->t_commit = guest_ns(); atomic_store(&pr->claimed, 0); atomic_store(&pr->fence, fence);
+@@ -1491,6 +1523,7 @@ uint64_t mtl_sub_commit(void) {
+         if (ws_on()) ws_fb(fence, cb.GPUEndTime);
+         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
+         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
++        hk_done(hk, cb.error, "submission");
+         post_complete(fence, c0, c1);
+         defer_drain();
+     }];
+@@ -8923,6 +8956,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
+       if (small > 0 && R.has_rt && !g_defer_replaying) { int k = R.rt.n && R.rt.color[0] ? 0 : R.rt.depth ? 8 : -1;
+         if (k >= 0) { uint64_t s_; int lv, sl; rt_sub(&R.rt, k, &s_, &lv, &sl); const tex_t *t = k == 8 ? R.rt.depth : R.rt.color[0]; if ((int)MAX(t->d.width >> lv, 1u) <= small) return; } } }
+     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK && !S.rast_discard) { PD("Z %llu draw skipped (before the pass begins): both faces culled", g_stat_pass + !g_enc); return; }
++    for (int i = 0; i < 5; i++) if (pr->sh[i]) hk_note(pr->sh[i]->key, "vfgtt"[i]);   // GPU hang report
+     // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
+     if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
+         static int once2; if (!once2++) MLOG("same-target continuation: a draw in the continued pass needs a depth / stencil plane that is not attached; split here (first case pass %llu)", g_stat_pass);
+@@ -9239,6 +9273,7 @@ static void dispatch(const p_dispatch *dp) {
+     if (dp->ind) { static int once; if (!once++) MLOG("indirect dispatch: first time (the GPU reads the threadgroup counts from %#llx)", (unsigned long long)dp->ind); }
+     NvShader *cs = prog_get(S.cprog)->sh[5];
+     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
++    hk_note(cs->key, 'c');   // GPU hang report
+     const void *k = (__bridge const void *)cs;
+     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
+     if (!ps) {
+@@ -9748,8 +9783,10 @@ static void sub_cut(void) {
+     uint32_t k = g_seg++; seg_clk *sc = NULL;   // reports encoded so far keep this segment's GPU times (seg_ts)
+     if (seg_ts()) { if (!g_sclk) { g_sclk = calloc(1, sizeof *g_sclk); atomic_store(&g_sclk->refs, 1); } sc = g_sclk; atomic_fetch_add(&sc->refs, 1); }
+     MTL4CommitOptions *o = [MTL4CommitOptions new];
++    hk_set *hk = hk_take();
+     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
+         gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime);
++        hk_done(hk, cb.error, "segment");
+         if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
+         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); }
+     }];

@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoshi Sugawara <yoshi.sugawara@gmail.com>
+Date: Wed, 28 Oct 2026 09:06:01 -1000
+Subject: [PATCH] movie: a released video output decodes the next packets
+ later, on the deferred thread
+
+The SDK decodes on its own codec thread, so a returned output comes back as a
+new picture only later. Decoded inside ReleaseOutputBufferIndex, DRAGON QUEST
+XI S's render-thread fetch loop (main+0x39f0960) never ran dry: the opening
+movie was decoded and dropped within seconds, and the looping movie after
+name entry held the render thread for good. Audio still decodes in place.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: DRAGON QUEST XI S JP (010054A0085CA000) bring-up on iOS: see the commit message
+Issue: none yet (local bring-up of DRAGON QUEST XI S JP, 010054A0085CA000)
+
+---
+ dm/host/hle_movie.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_movie.c b/dm/host/hle_movie.c
+index d7f0590..353eead 100644
+--- a/dm/host/hle_movie.c
++++ b/dm/host/hle_movie.c
+@@ -146,6 +146,8 @@ void dm_host_lock(pthread_mutex_t *m);   // hle_thread.c
+ static pthread_mutex_t g_dfmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dfcv = PTHREAD_COND_INITIALIZER;
+ static struct { void *d; int ev; uint64_t due; } g_dfq[64]; static int g_ndfq, g_dfthr;
+ static void md_defer_body(void *arg);
++static void md_pump(mdec_t *d);
++#define MD_EV_PUMP 4   // a deferred entry that decodes the queued packets (h_movie_RelOut) instead of signalling an event
+ static void md_defer_at(void *d, int ev, uint64_t due) {
+     dm_host_lock(&g_dfmu);
+     if (!g_dfthr) { g_dfthr = 1; dm_guest_thread_spawn(md_defer_body, NULL, 16, 64 << 10); }
+@@ -170,7 +172,7 @@ static void md_defer_body(void *arg) {
+         if (k >= 0) {
+             mdec_t *d = g_dfq[k].d; int e = g_dfq[k].ev;
+             memmove(g_dfq + k, g_dfq + k + 1, (size_t)(--g_ndfq - k) * sizeof *g_dfq);
+-            if (d->started) md_event(d, e);   // not after Stop: the game takes its events apart right after Stop (a Stop within 2 ms of a Flush let the deferred signal hit events being torn down)
++            if (d->started) { if (e == MD_EV_PUMP) md_pump(d); else md_event(d, e); }   // not after Stop: the game takes its events apart right after Stop (a Stop within 2 ms of a Flush let the deferred signal hit events being torn down)
+             continue;
+         }
+         if (!next) pthread_cond_wait(&g_dfcv, &g_dfmu);
+@@ -777,7 +779,12 @@ HLE_FORCE("_ZN5movie7Decoder24ReleaseOutputBufferIndexEi", "movie decoder: relea
+     MD_TRACE(d, 13, "ReleaseOutputBufferIndex index %d (%d packets queued%s)", i, queued, drain ? ", H.264 pictures draining" : "");
+     // An H.264 drain waits for a free slot too: AI: THE SOMNIUM FILES (Unity 2017.4) held all 16 video slots when its logo movie's end-of-stream packet came, the drain stopped
+     // with no packet queued, the last pictures and the end-of-stream flag never came out, and the game waited for the movie's end for good
+-    if (queued || drain) md_pump(d);
++    // A video output returned: the queued packets are decoded on the deferred-event thread a millisecond later, not inside this call. The SDK's decoder decodes on its own codec thread
++    // (NVDEC), so a returned output comes back as a new picture only later. DRAGON QUEST XI S's render thread takes frames in a loop while any are queued (main+0x39f0960; its first
++    // fetch takes every one and returns all but the newest): decoded inside the release, each returned output was a new queued picture before the loop looked again, so the loop never ran
++    // dry. The opening movie was decoded and dropped within seconds with one picture shown, and the looping movie after name entry held the render thread for good (010054A0085CA000).
++    // Audio outputs still decode here
++    if (queued || drain) { if (MD_AUDIO(d)) md_pump(d); else md_defer_at(d, MD_EV_PUMP, now_ns() + 1000000); }
+     return 0;
+ }
+ HLE_FORCE("_ZN5movie7Decoder12GetLastErrorEv", "movie decoder: last error (none)", int, h_movie_LastErr, void **self) { (void)self; return 0; }

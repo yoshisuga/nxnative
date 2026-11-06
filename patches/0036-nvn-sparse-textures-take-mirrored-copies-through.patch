@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoshi Sugawara <yoshi.sugawara@gmail.com>
+Date: Thu, 29 Oct 2026 12:24:53 -1000
+Subject: [PATCH] nvn: sparse textures take mirrored copies through the page
+ table and skip unwritten compressed levels
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: 1.60's streamed sparse ASTC textures were sampled at unwritten levels and lost GPU copies: magenta
+Issue: none yet (Bloodstained: Ritual of the Night 1.60 bring-up)
+
+---
+ dm/gfx/nvn/hle_nvn.c | 35 ++++++++++++++++++++++++++++++++---
+ dm/gfx/nvn/nvn_mtl.m | 23 +++++++++++++++++++++--
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index 0466e3d7..c42d4344 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -2393,6 +2393,18 @@ int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) {   // every pag
+     pthread_mutex_unlock(&g_vp_mu); return ok;
+ }
+ void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
++// The other way: n bytes from src into the physical pages behind [a, a+n), each marked written (so nvn_sparse_since sees it, as a guest store would be); unmapped pages drop their
++// bytes, as the hardware's writes through an unmapped page do
++void nvn_sparse_write(const void *pool, uint64_t a, const void *src, uint64_t n) {
++    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a);
++    for (uint64_t p = 0, o = v ? a - (uint64_t)(uintptr_t)v->base : 0; v && p < n;) {
++        uint64_t at = o + p, k = 0x1000 - (at & 0xFFF); if (k > n - p) k = n - p;
++        const vpte *e = at < v->size ? vpt_get(v, at) : NULL;
++        if (e && e->phys) { dm_guest_write_prepare(e->phys + (at & 0xFFF), k); memcpy(e->phys + (at & 0xFFF), (const uint8_t *)src + p, k); }
++        p += k;
++    }
++    pthread_mutex_unlock(&g_vp_mu);
++}
+ NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind) {
+     rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, ib, ind});
+ }
+@@ -2532,13 +2544,28 @@ static int mirror_prepare(const tex_t *t, unsigned level, unsigned layer) {   //
+     dm_guest_write_prepare(t->mem + (uint64_t)layer * t->L.layer_size + lo, hi - lo);
+     return 0;
+ }
++// A texture in a sparse pool keeps its bytes in the physical pages its page table points at, which an upload reads (nvn_sparse_copy); its own address range holds nothing. A mirror
++// into one writes a copy of the level and scatters it back through the table (nvn_sparse_write). Bloodstained: Ritual of the Night 1.60 (Unreal Engine 4.22) streams the 256 and 128
++// levels of its characters' 1024×1024 ASTC 6×6 textures in with nvnCommandBufferCopyBufferToTexture: written to the address range, they never reached the upload, and its all-zero
++// blocks made the characters magenta
++static int mirror_write(const tex_t *t, unsigned level, unsigned layer, const NVNcopyRegion *r, const uint8_t *src, size_t row, int bw, int bh, int bpb) {
++    if (!(t->pool && nvn_sparse_pool(t->pool))) return mirror_prepare(t, level, layer) || write_region_bl(t, level, layer, r, src, row, bw, bh, bpb) ? -1 : 0;
++    uint64_t lo = nvn_tex_level_offset(&t->d, level), hi = level + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, level + 1) : t->L.layer_size, at = (uint64_t)layer * t->L.layer_size + lo;
++    if (hi <= lo || hi > t->L.layer_size || at + (hi - lo) > t->L.size) return -1;
++    uint8_t *buf = malloc(hi - lo); if (!buf) die("texture copy mirror allocation failed");
++    uint64_t a = (uint64_t)(uintptr_t)t->mem + at; nvn_sparse_copy(t->pool, buf, a, hi - lo);
++    tex_t lt = *t; lt.mem = buf - at;   // write_region_bl writes at mem + the level's offset: here into buf
++    int bad = write_region_bl(&lt, level, layer, r, src, row, bw, bh, bpb);
++    if (!bad) nvn_sparse_write(t->pool, a, buf, hi - lo);
++    free(buf); return bad ? -1 : 0;
++}
+ int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
+     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+     if (!t->mem || !bpb || t->d.target == NVN_TEXTURE_TARGET_3D || level >= t->d.levels) return -1;
+     int nz = r->depth ? r->depth : 1;
+     for (int z = 0; z < nz; z++) {
+         unsigned layer = layer0 + (unsigned)(r->zoffset + z);
+-        if (mirror_prepare(t, level, layer) || write_region_bl(t, level, layer, r, src + (size_t)z * img, row, bw, bh, bpb)) return -1;
++        if (mirror_write(t, level, layer, r, src + (size_t)z * img, row, bw, bh, bpb)) return -1;
+     }
+     return 0;
+ }
+@@ -2550,12 +2577,14 @@ int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRe
+     size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh, x0 = (size_t)(sr->xoffset / bw) * bpb, y0 = (size_t)(sr->yoffset / bh);
+     if (x0 + (size_t)((sr->width + bw - 1) / bw) * bpb > lp || y0 + (size_t)((sr->height + bh - 1) / bh) > lr) return -1;
+     uint8_t *lin = malloc(lp * lr); if (!lin) die("texture copy mirror allocation failed");
++    uint8_t *sm = s->mem, *part = NULL;   // a sparse source is read through its page table
++    if (s->pool && nvn_sparse_pool(s->pool)) { if (!(part = malloc(s->L.size))) die("texture copy mirror allocation failed"); nvn_sparse_copy(s->pool, part, (uint64_t)(uintptr_t)s->mem, s->L.size); sm = part; }
+     int nz = sr->depth ? sr->depth : 1, ok = 1;
+     for (int z = 0; z < nz && ok; z++) {
+         unsigned layer = ds + (unsigned)(dr->zoffset + z);
+-        ok = !nvn_deswizzle(&s->d, sl, ss + (unsigned)(sr->zoffset + z), s->mem, lin, lp) && !mirror_prepare(d, dl, layer) && !write_region_bl(d, dl, layer, dr, lin + y0 * lp + x0, lp, bw, bh, bpb);
++        ok = !nvn_deswizzle(&s->d, sl, ss + (unsigned)(sr->zoffset + z), sm, lin, lp) && !mirror_write(d, dl, layer, dr, lin + y0 * lp + x0, lp, bw, bh, bpb);
+     }
+-    free(lin);
++    free(lin); free(part);
+     return ok ? 0 : -1;
+ }
+ // The movie decoder's native-texture output (DecoderMode 2, hle_movie.c): a whole frame into level 0 of the client texture, as WriteTexels does; returns the texture format, or −1 when the object is not a texture
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index db5a496e..fb958a92 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -2502,9 +2502,26 @@ static void sparse_view(NvPkg *pk, const tex_t *t) {
+             r--; }
+     else r = 0;
+     if (r == n) r = n - 1;   // nothing mapped: the smallest level (reads 0)
++    // A mapped level can still be unwritten: Bloodstained: Ritual of the Night 1.60 (Unreal Engine 4.22) maps the whole 64 KB mip tail of its characters' 1024×1024 ASTC 6×6 textures
++    // (levels 2-10) but has streamed in only levels 4 and down, and samples no finer until it streams the rest in (the LOD clamp the translator drops). Bound from level 2, levels 2 and 3
++    // read all-zero blocks, which ASTC decodes as magenta. A block-compressed level whose bytes are all zero is skipped as well; once the game writes it, the re-upload binds it again
++    int bw = 1, bh = 1; nvn_fmt_bpb(t->d.format, &bw, &bh);
++    if (t->d.target == NVN_TEXTURE_TARGET_2D && bw > 1 && r + 1 < n) {
++        uint64_t top = nvn_tex_level_offset(&t->d, r), end = nvn_tex_level_offset(&t->d, n - 1);   // the levels that may be skipped: from r up to the smallest
++        uint8_t *buf = end > top ? malloc(end - top) : NULL;
++        if (buf) {
++            nvn_sparse_copy(t->pool, buf, (uint64_t)(uintptr_t)t->mem + top, end - top);
++            for (; r + 1 < n; r++) {
++                uint64_t lo = nvn_tex_level_offset(&t->d, r) - top, hi = nvn_tex_level_offset(&t->d, r + 1) - top; int z = hi > lo;
++                for (uint64_t i = lo; i + 8 <= hi && z; i += 8) { uint64_t w; memcpy(&w, buf + i, 8); z = !w; }
++                if (!z) break;
++            }
++            free(buf);
++        }
++    }
+     if (pk->view) defer_obj_unref(pk->view);   // a view shares its texture's allocation: drop only the reference, the residency set keeps the texture
+     pk->view = r ? [pk->tex newTextureViewWithPixelFormat:pk->tex.pixelFormat textureType:pk->tex.textureType levels:NSMakeRange(r, n - r) slices:NSMakeRange(0, 1)] : nil;
+-    if (r != (unsigned)pk->vbase) { static int nl; if (nl++ < 6) MLOG("sparse texture ser=%llu %ux%u: sampled from level %u of %u (finer levels not mapped)", (unsigned long long)t->serial, t->d.width, t->d.height, r, n); }
++    if (r != (unsigned)pk->vbase) { static int nl; if (nl++ < 6) MLOG("sparse texture ser=%llu %ux%u: sampled from level %u of %u (finer levels not mapped or not written)", (unsigned long long)t->serial, t->d.width, t->d.height, r, n); }
+     pk->vbase = (int)r;
+ }
+ static uint64_t g_texinfo_ser[8]; static int g_texinfo_n;
+@@ -9402,8 +9419,10 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
+ // tex_flush_upload / tex_dirty_upload registered and has not resolved yet; not one the GPU owns. A GPU copy into such a texture is written into its storage as well (nvn_tex_mirror_b2t /
+ // nvn_tex_mirror_t2t in hle_nvn.c), as the hardware's copy would, so that an upload from the storage carries the copied levels (the reasons are there): on the CPU from the source's storage
+ // when that holds the source's content (tex_storage_src), else read back after the copy (mirror_readback)
++// A sparse virtual pool's texture counts too: its storage is the physical pages behind its page table, which the mirror writes through (hle_nvn.c mirror_write). Refused, Bloodstained:
++// Ritual of the Night 1.60's streamed character mips reached only the host texture, and the next upload from the storage (a page of the texture written) dropped them: magenta
+ static int tex_storage_dst(const tex_t *t) {
+-    if (!t->mem || !t->pool || (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER
++    if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || ((t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && !nvn_sparse_pool(t->pool)) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER
+         || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE))) return 0;
+     if (t->has_layout || tex_cpu_written(t->serial) || nvn_ft_tracked(t->serial)) return !mtl_tex_gpu_owned(t->serial);
+     return [tex_get(t->serial) isKindOfClass:[NvPkg class]];

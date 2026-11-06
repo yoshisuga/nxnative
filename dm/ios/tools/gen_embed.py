@@ -2,8 +2,8 @@
 #   __TEXT,__dm<name>x0   original text: [0, round16K(TEXT_END)) (includes part of the first ro page, read-only)
 #   __DM<name>W,__img     RW segment: [round16K(TEXT_END), PATCH_OFF), rest of ro + data + bss (relocations land only here)
 #   __TEXT,__dm<name>x1   patch area: [PATCH_OFF, round16K(end of file))
-#   __TEXT,__dm<name>x2   only with a back patch area (patch_nso.py TWO, a text longer than a B reaches): the last BACK_LEN bytes of the file, mapped at BACK_OFF
 #   Modules with the patch area before the base (negative PATCH_OFF, see patch_nso.py FAR): W is [round16K(TEXT_END), FILE_IMAGE_LEN), x1 is the patch area after FILE_IMAGE_LEN in the file; bss and the key page are not in the executable
+#   __TEXT,__dm<name>x2   with a back patch area too (PATCH2_OFF, patch_nso.py HUGE: text longer than a B reaches): x1 is the front area's PATCH_LEN bytes, x2 the back area after it in the file
 # The three pieces are not adjacent in the executable; at run time the loader (loader.c iOS branch) reserves one contiguous address range and vm_remaps them back at their original relative positions (code pages share the signed pages, W is copy-on-write),
 # so the run-time layout is byte-identical to the original image: PC-relative addressing between original code and data, relative jumps in the patch area, and the host's "base + original offset" references all need no change.
 # The NRO modules the game loads at run time (nro.tsv beside the modules, dm/tools/nro_collect.py; Super Smash Bros. Ultimate: 98) are packed instead of getting sections of their own: a Mach-O
@@ -22,9 +22,13 @@ def pieces(n):   # the module's (x0, W, x1[, x2]) as (file start, end)
     bin_ = os.path.abspath(f'{out}/{n}.patched.bin'); sz = os.path.getsize(bin_)
     a, end = r16(te), r16(sz)
     if po < 0:   # patch area before the base (patch_nso.py FAR): W ends at the end of data, the loader supplies zero pages for bss and the key page; in the file the patch area follows at FILE_IMAGE_LEN
-        fl, bl = int(hdr['FILE_IMAGE_LEN'], 16), int(hdr.get('BACK_LEN', '0'), 16)
-        assert fl % PG == 0 and a <= fl and ko % PG == 0 and ks == PG and ko >= fl and bl % PG == 0 and (not bl or sz % PG == 0)
-        return bin_, sz, ((0, a), (a, fl), (fl, end - bl)) + (((end - bl, end),) if bl else ())
+        fl = int(hdr['FILE_IMAGE_LEN'], 16)
+        assert fl % PG == 0 and a <= fl and ko % PG == 0 and ks == PG and ko >= fl
+        if 'PATCH2_OFF' in hdr:
+            pl, p2 = int(hdr['PATCH_LEN'], 16), int(hdr['PATCH2_LEN'], 16)
+            assert pl % PG == 0 and p2 % PG == 0 and fl + pl <= sz <= fl + pl + p2
+            return bin_, sz, ((0, a), (a, fl), (fl, fl + pl), (fl + pl, fl + pl + p2))
+        return bin_, sz, ((0, a), (a, fl), (fl, end))
     assert po % PG == 0 and a <= ko and ko + ks <= po and ko % PG == 0 and ks == PG
     return bin_, sz, ((0, a), (a, po), (po, end))
 def place(asm, bin_, sz, lo, hi):   # one piece, 16K aligned at both ends (vm_remap takes whole pages)
@@ -48,7 +52,7 @@ if nros:
         asm.append(f'    .section {sect}')
         for k, n in enumerate(nros):
             bin_, sz, parts = pieces(n); lo, hi = parts[i]
-            assert len(parts) == 3, f'NRO {n} has a back patch area, which the packed NRO sections do not hold'
+            assert len(parts) == 3, f'NRO {n} has a back patch area, which the NRO table has no column for'
             if i == 0: rows.append([n])
             rows[k] += [at[i], hi - lo]; at[i] += hi - lo
             place(asm, bin_, sz, lo, hi)

@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoshi Sugawara <yoshi.sugawara@gmail.com>
+Date: Thu, 29 Oct 2026 12:24:53 -1000
+Subject: [PATCH] rewriter, loaders: a second patch area for text longer than a
+ B reaches (Bloodstained: Ritual of the Night 1.60, 138.6 MB)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: 1.60's main has 138.6 MB of text, more than one patch area reaches with a B
+Issue: none yet (Bloodstained: Ritual of the Night 1.60 bring-up)
+
+---
+ dm/host/dm.h              |  1 +
+ dm/host/hle_svc.c         |  2 ++
+ dm/host/loader.c          | 23 ++++++++++++++++--
+ dm/ios/tools/gen_embed.py | 10 ++++++--
+ dm/tools/patch_nso.py     | 51 +++++++++++++++++++++++++++------------
+ 5 files changed, 68 insertions(+), 19 deletions(-)
+
+diff --git a/dm/host/dm.h b/dm/host/dm.h
+index 54f15f61..bf91feab 100644
+--- a/dm/host/dm.h
++++ b/dm/host/dm.h
+@@ -52,6 +52,7 @@ typedef struct {
+     uint64_t fps_state_off;    // frame step state page (patch_nso.py FRAME_STEP: Tears of the Kingdom 1.4.3 and Breath of the Wild 1.9.0 main); 0 = none
+     int64_t patch_off;         // patch area relative to the base; negative = before the base (image too large, see patch_nso.py FAR), and size does not include it
+     uint64_t image_size, file_image_len, patch_len;   // only with the patch area before the base: whole image (with bss and key page), length of the image part of the file, patch area length
++    uint64_t patch2_off, patch2_len;   // a second patch area after the key page, for text longer than a B reaches (patch_nso.py HUGE: Bloodstained: Ritual of the Night 1.60); 0 = none. Inside size
+     char build_id[33];         // First 16 bytes of the NSO build ID (hex); empty for older build outputs
+     unsigned key_idx[4];       // key page index of each thread slot (K18, KTLS, KTLR, KGATE)
+     const Elf64_Dyn *dyn;
+diff --git a/dm/host/hle_svc.c b/dm/host/hle_svc.c
+index 0673018b..02581dae 100644
+--- a/dm/host/hle_svc.c
++++ b/dm/host/hle_svc.c
+@@ -209,6 +209,7 @@ static void module_data_query(const module_t *m, uint64_t off, uint64_t *lo, uin
+     module_readonly_run(off, 0, (m->text_end + 0x3fff) & ~UINT64_C(0x3fff), lo, hi, perm);
+     if (m->patch_off > 0) module_readonly_run(off, (uint64_t)m->patch_off & ~UINT64_C(0x3fff), m->size, lo, hi, perm);
+     module_readonly_run(off, m->key_page_off, m->key_page_off + m->key_page_size, lo, hi, perm);
++    if (m->patch2_len) module_readonly_run(off, m->patch2_off, m->patch2_off + m->patch2_len, lo, hi, perm);
+ }
+ static int map_source_backed(uint64_t src, uint64_t size) {
+     if (memory_contains((uintptr_t)g_heap, g_heap_cur, src, size)) return 1;
+@@ -517,6 +518,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+             module_t *mm = module_of(a); uint64_t off = (uint64_t)(a - mm->base), mb = (uint64_t)mm->base;
+             uint64_t ro = mm->ro_off ? mm->ro_off : mm->text_end, da = mm->data_off ? mm->data_off : ro, pa = mm->patch_off > 0 ? (uint64_t)mm->patch_off : mm->size;
+             if (a < mm->base)  { base = mb + mm->patch_off; size = mm->patch_len; state = 4/*CodeData*/; perm = 5; }
++            else if (mm->patch2_len && off >= mm->patch2_off && off < mm->patch2_off + mm->patch2_len) { base = mb + mm->patch2_off; size = mm->patch2_len; state = 4/*CodeData*/; perm = 5; }   // the back patch area, as the front one
+             else if (off < ro) { base = mb;      size = ro;            state = 3/*Code*/;     perm = 5; }
+             else if (off < da) { base = mb + ro; size = da - ro;       state = 3/*Code*/;     perm = 1; }
+             else if (off < pa) { base = mb + da; size = pa - da;       state = 4/*CodeData*/; perm = 3; }
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index c45124eb..5727098c 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -194,6 +194,9 @@ static void read_layout(module_t *m, const char *dir) {
+         if (!strcmp(key, "PATCH_OFF")) m->patch_off = strtoll(line + 2 + strlen(key), NULL, 16);   // may be negative (patch area before the base)
+         else if (!strcmp(key, "IMAGE_SIZE")) m->image_size = v;
+         else if (!strcmp(key, "FILE_IMAGE_LEN")) m->file_image_len = v;
++        else if (!strcmp(key, "PATCH_LEN")) m->patch_len = v;   // with a back patch area: the front one's padded length in the file
++        else if (!strcmp(key, "PATCH2_OFF")) m->patch2_off = v;
++        else if (!strcmp(key, "PATCH2_LEN")) m->patch2_len = v;
+         else if (!strcmp(key, "KEY_PAGE_OFF")) m->key_page_off = v;
+         else if (!strcmp(key, "KEY_PAGE_SIZE")) m->key_page_size = v;
+         else if (!strcmp(key, "TEXT_END")) m->text_end = v;
+@@ -213,6 +216,8 @@ static void read_layout(module_t *m, const char *dir) {
+         die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
+     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))
+         die("%s: patch area before the base, but IMAGE_SIZE / FILE_IMAGE_LEN missing or wrong", path);
++    if (m->patch2_off && (m->patch_off >= 0 || !m->patch_len || m->patch_len % 0x4000 || m->patch2_off % 0x4000 || m->patch2_len % 0x4000 || m->patch2_off < m->key_page_off + m->key_page_size || m->patch2_off + m->patch2_len > m->image_size))
++        die("%s: a back patch area (PATCH2_OFF), but the layout is wrong", path);
+ }
+ 
+ // Frame step state (the page after the key page, read-write; layout in patch_nso.py FRAME_STEP): the rewriter's stubs step the game by the host's whole vsyncs capped at this
+@@ -535,6 +540,10 @@ static void map_image(module_t *m, const char *dir) {
+     if (m->nro) { if (!nro_pieces(m->name, &x0, &z0, &w, &zw, &x1, &z1)) die("NRO %s: not in the embedded NRO table (__DATA,__dm_nro_tab)", m->name); }
+     else { x0 = getsectiondata(IMAGE_MH, "__TEXT", sx0, &z0); w = getsectiondata(IMAGE_MH, dm, "__img", &zw); x1 = getsectiondata(IMAGE_MH, "__TEXT", sx1, &z1); }
+     if (!x0 || !w || !x1) die("embedded sections %s / %s / %s missing", sx0, dm, sx1);
++    // The back patch area (patch2_off, patch_nso.py HUGE) is a fourth section, __TEXT,__dm<name>x2, remapped after the key page
++    const uint8_t *x2 = NULL; unsigned long z2 = 0; char sx2[17]; snprintf(sx2, sizeof sx2, "__dm%sx2", m->name);
++    if (m->patch2_off && (m->nro || !(x2 = getsectiondata(IMAGE_MH, "__TEXT", sx2, &z2)) || z2 != m->patch2_len || z1 != m->patch_len || ((uintptr_t)x2 & 0x3FFF)))
++        die("%s: embedded back patch area %s missing or of the wrong size", m->name, sx2);
+     // Patch area before the base (patch_off < 0): W ends at the end of data (FILE_IMAGE_LEN); bss and the key page are zero pages from vm_allocate and are not in the executable
+     int front = m->patch_off < 0;
+     if (z0 + zw != (front ? m->file_image_len : (uint64_t)m->patch_off) || (z0 & 0x3FFF) || (zw & 0x3FFF) || (z1 & 0x3FFF) || ((uintptr_t)x0 & 0x3FFF) || ((uintptr_t)w & 0x3FFF) || ((uintptr_t)x1 & 0x3FFF))
+@@ -550,6 +559,7 @@ static void map_image(module_t *m, const char *dir) {
+     // A module with nothing to rewrite has an empty patch area (87 of Super Smash Bros. Ultimate's 98 NROs: no x18, SVC or TLS register use); vm_remap refuses 0 bytes
+     // (KERN_INVALID_ARGUMENT), which stopped the app at launch on an iPhone at the first such NRO (found in PR #94)
+     if (z1) remap_at(m, base + m->patch_off, x1, z1, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
++    if (z2) remap_at(m, base + m->patch2_off, x2, z2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+     m->base = (uint8_t *)base; install_key_page(m);
+ }
+ #else
+@@ -571,12 +581,21 @@ static void map_image(module_t *m, const char *dir) {
+         // Patch area before the base: file = the first part of the image (text + ro + data) + patch area; bss and the key page are anonymous zero pages. The gap from the patch area's end to the base is left inaccessible (PROT_NONE)
+         uint64_t pre = (uint64_t)-m->patch_off, fl = m->file_image_len;
+         if (sz < fl) die("%s is shorter than FILE_IMAGE_LEN %#llx", path, (unsigned long long)fl);
+-        m->size = m->image_size; m->patch_len = (sz - fl + 0x3FFF) & ~0x3FFFull;
++        // A back patch area (patch2_off, patch_nso.py HUGE) follows the front one, which the header then sizes (PATCH_LEN), in the file and goes after the key page
++        uint64_t back = 0;
++        if (m->patch2_off) {
++            if (sz < fl + m->patch_len || sz - fl - m->patch_len > m->patch2_len) die("%s does not hold FILE_IMAGE_LEN + PATCH_LEN + a back patch area of at most PATCH2_LEN", path);
++            back = sz - fl - m->patch_len;
++        } else m->patch_len = (sz - fl + 0x3FFF) & ~0x3FFFull;
++        m->size = m->image_size;
+         if (m->patch_len > pre) die("%s patch area of %#llx bytes does not fit in the %#llx before the base", path, (unsigned long long)m->patch_len, (unsigned long long)pre);
+         uint8_t *a = mmap(NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
+         m->base = a + pre;
+-        memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl); free(raw); install_key_page(m);
++        memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl - back);
++        if (back) memcpy(m->base + m->patch2_off, raw + fl + m->patch_len, back);
++        free(raw); install_key_page(m);
++        if (m->patch2_len && mprotect(m->base + m->patch2_off, m->patch2_len, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
+         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
+         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
+         if (mprotect(a, m->patch_len, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
+diff --git a/dm/ios/tools/gen_embed.py b/dm/ios/tools/gen_embed.py
+index a324f8ee..176c7ee1 100644
+--- a/dm/ios/tools/gen_embed.py
++++ b/dm/ios/tools/gen_embed.py
+@@ -3,6 +3,7 @@
+ #   __DM<name>W,__img     RW segment: [round16K(TEXT_END), PATCH_OFF), rest of ro + data + bss (relocations land only here)
+ #   __TEXT,__dm<name>x1   patch area: [PATCH_OFF, round16K(end of file))
+ #   Modules with the patch area before the base (negative PATCH_OFF, see patch_nso.py FAR): W is [round16K(TEXT_END), FILE_IMAGE_LEN), x1 is the patch area after FILE_IMAGE_LEN in the file; bss and the key page are not in the executable
++#   __TEXT,__dm<name>x2   with a back patch area too (PATCH2_OFF, patch_nso.py HUGE: text longer than a B reaches): x1 is the front area's PATCH_LEN bytes, x2 the back area after it in the file
+ # The three pieces are not adjacent in the executable; at run time the loader (loader.c iOS branch) reserves one contiguous address range and vm_remaps them back at their original relative positions (code pages share the signed pages, W is copy-on-write),
+ # so the run-time layout is byte-identical to the original image: PC-relative addressing between original code and data, relative jumps in the patch area, and the host's "base + original offset" references all need no change.
+ # The NRO modules the game loads at run time (nro.tsv beside the modules, dm/tools/nro_collect.py; Super Smash Bros. Ultimate: 98) are packed instead of getting sections of their own: a Mach-O
+@@ -14,7 +15,7 @@ import os, sys
+ out, dst, names = sys.argv[1], sys.argv[2], sys.argv[3:]
+ PG = 0x4000
+ def r16(x): return (x + PG - 1) & ~(PG - 1)
+-def pieces(n):   # the module's (x0, W, x1) as (file start, end)
++def pieces(n):   # the module's (x0, W, x1[, x2]) as (file start, end)
+     hdr = dict(l[2:].split() for l in open(f'{out}/{n}.fixups.tsv'))
+     te, po = int(hdr['TEXT_END'], 16), int(hdr['PATCH_OFF'], 16)
+     ko, ks = int(hdr['KEY_PAGE_OFF'], 16), int(hdr['KEY_PAGE_SIZE'], 16)
+@@ -23,6 +24,10 @@ def pieces(n):   # the module's (x0, W, x1) as (file start, end)
+     if po < 0:   # patch area before the base (patch_nso.py FAR): W ends at the end of data, the loader supplies zero pages for bss and the key page; in the file the patch area follows at FILE_IMAGE_LEN
+         fl = int(hdr['FILE_IMAGE_LEN'], 16)
+         assert fl % PG == 0 and a <= fl and ko % PG == 0 and ks == PG and ko >= fl
++        if 'PATCH2_OFF' in hdr:
++            pl, p2 = int(hdr['PATCH_LEN'], 16), int(hdr['PATCH2_LEN'], 16)
++            assert pl % PG == 0 and p2 % PG == 0 and fl + pl <= sz <= fl + pl + p2
++            return bin_, sz, ((0, a), (a, fl), (fl, fl + pl), (fl + pl, fl + pl + p2))
+         return bin_, sz, ((0, a), (a, fl), (fl, end))
+     assert po % PG == 0 and a <= ko and ko + ks <= po and ko % PG == 0 and ks == PG
+     return bin_, sz, ((0, a), (a, po), (po, end))
+@@ -35,7 +40,7 @@ asm = ['// Generated by dm/ios/tools/gen_embed.py; do not edit']
+ flags = []
+ for n in names:
+     bin_, sz, parts = pieces(n)
+-    for sect, (lo, hi) in zip((f'__TEXT,__dm{n}x0', f'__DM{n}W,__img', f'__TEXT,__dm{n}x1'), parts):
++    for sect, (lo, hi) in zip((f'__TEXT,__dm{n}x0', f'__DM{n}W,__img', f'__TEXT,__dm{n}x1', f'__TEXT,__dm{n}x2'), parts):
+         assert all(len(x) <= 16 for x in sect.split(','))
+         asm.append(f'    .section {sect}'); place(asm, bin_, sz, lo, hi)
+     flags.append(f'-Wl,-segprot,__DM{n}W,rw,rw')
+@@ -47,6 +52,7 @@ if nros:
+         asm.append(f'    .section {sect}')
+         for k, n in enumerate(nros):
+             bin_, sz, parts = pieces(n); lo, hi = parts[i]
++            assert len(parts) == 3, f'NRO {n} has a back patch area, which the NRO table has no column for'
+             if i == 0: rows.append([n])
+             rows[k] += [at[i], hi - lo]; at[i] += hi - lo
+             place(asm, bin_, sz, lo, hi)
+diff --git a/dm/tools/patch_nso.py b/dm/tools/patch_nso.py
+index 8c96c519..d967fb78 100644
+--- a/dm/tools/patch_nso.py
++++ b/dm/tools/patch_nso.py
+@@ -33,7 +33,12 @@ FAR, FRONT = NEAR_PATCH_OFF > 0x7000000, 0x2000000
+ # order, so the last site's stub ends up about as far from it as the text is long. The first pass tries the gap that keeps every site in reach; when the patch area does not fit there
+ # (Monster Hunter Rise: 3.6 MB), the rewriter runs again with exactly the size it needs (DM_PATCH_FRONT, set only by that rerun) and B() checks every branch
+ BIG_TEXT = FAR and MOD.text_end + FRONT > 0x8000000 - 0x10000
+-if BIG_TEXT: FRONT = int(os.environ.get('DM_PATCH_FRONT', '0'), 0) or (0x8000000 - 0x10000 - MOD.text_end) & ~0xFFFF
++# A text segment longer than one B reaches (Bloodstained: Ritual of the Night 1.60: 138.6 MB) gets a second patch area (HUGE): the sites below SPLIT keep the front area, those from SPLIT on
++# go to a back area after the key page (PATCH2_OFF), which they reach going forward. The front area is sized as BIG_TEXT's (a rerun with DM_PATCH_FRONT when it does not fit); each area
++# keeps its stubs in site order. Modules without it produce the same output as before
++HUGE = FAR and MOD.text_end + 0x10000 + 0x100000 > 0x8000000
++if HUGE: FRONT = int(os.environ.get('DM_PATCH_FRONT', '0'), 0) or 0x400000
++elif BIG_TEXT: FRONT = int(os.environ.get('DM_PATCH_FRONT', '0'), 0) or (0x8000000 - 0x10000 - MOD.text_end) & ~0xFFFF
+ IMG = MOD.image
+ if not FAR: IMG.extend(bytes(bss))
+ TEXT_END = MOD.text_end
+@@ -42,6 +47,11 @@ if FAR:
+     FILE_IMAGE_LEN = (len(IMG) + 0x3FFF) & ~0x3FFF
+     KEY_PAGE_OFF = (len(IMG) + bss + 0x3FFF) & ~0x3FFF
+     IMAGE_SIZE, PATCH_OFF = KEY_PAGE_OFF + 0x4000, -FRONT
++    if HUGE:   # the back area starts after the key page and the frame step state page; SPLIT halves the overlap of what the two areas reach (4 MB kept for each area's own length)
++        PATCH2_OFF = (KEY_PAGE_OFF + 0x8000 + 0xFFFF) & ~0xFFFF
++        lo, hi = PATCH2_OFF + 0x400000 - 0x8000000, 0x8000000 - 0x400000
++        assert lo < hi and lo < MOD.text_end, f'text of {MOD.text_end:#x} with the back patch area at {PATCH2_OFF:#x}: no split reaches both areas'
++        SPLIT = (lo + hi) // 2 & ~3
+ else:
+     KEY_PAGE_OFF = (len(IMG) + 0x3FFF) & ~0x3FFF
+     IMG.extend(bytes(0x4000))
+@@ -129,8 +139,13 @@ KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE'))}
+ 
+ md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True
+ patch = bytearray(); fix = []; gates = []; stats = {}
++patch1, patch2, AREA_OFF = patch, bytearray(), PATCH_OFF   # the front (or only) patch area and the back one (HUGE)
++def use_area(a):   # emit the stubs of the site at module offset a into the area that reaches it
++    global patch, AREA_OFF
++    back = HUGE and a >= SPLIT
++    patch, AREA_OFF = (patch2, PATCH2_OFF) if back else (patch1, PATCH_OFF)
+ def stat(k): stats[k] = stats.get(k, 0) + 1
+-def here(): return PATCH_OFF + len(patch)
++def here(): return AREA_OFF + len(patch)
+ def emit(w, kind=None):
+     if kind: fix.append((len(patch), kind))
+     patch.extend(struct.pack('<I', w & 0xFFFFFFFF))
+@@ -1036,12 +1051,12 @@ if far_into:   # functions analysed in pieces (pieces above): their far b / bl,
+ 
+ def put_branch(at, to): struct.pack_into('<I', IMG, at, B(at, to))
+ for wseg in windows:
+-    st, lo, hi = site_window(wseg); stat('window'); put_branch(lo, st)
++    use_area(wseg[0].address); st, lo, hi = site_window(wseg); stat('window'); put_branch(lo, st)
+ for parts in retries:
+-    st = site_retry_window(parts); stat('retry_window'); put_branch(parts[0][0][0].address, st)
++    use_area(parts[0][0][0].address); st = site_retry_window(parts); stat('retry_window'); put_branch(parts[0][0][0].address, st)
+ for a in sorted(kinds):
+     if a in done: continue
+-    k, arg = kinds[a]
++    k, arg = kinds[a]; use_area(a)
+     ins = dis(struct.unpack_from('<I', IMG, a)[0], a)
+     if k == 'x18':
+         m = ins.mnemonic
+@@ -1091,7 +1106,7 @@ for off, oid, ow, why in obs:
+     after_bl = off >= 4 and struct.unpack_from('<I', IMG, off - 4)[0] >> 26 == 0x25
+     assert off in set(starts) or after_bl or scratch_dead(off), f'observation gate neither at a function entry, after a bl nor before a call with x9–x17 unread {off:#x}'
+     assert off < TEXT_END and off not in kinds and not any(lo <= off < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'observation gate conflicts with a rewrite site {off:#x}'
+-    put_branch(off, site_obs(off, oid, w)); stat('obs')
++    use_area(off); put_branch(off, site_obs(off, oid, w)); stat('obs')
+ 
+ # ---- Address regions (every module that defines the SDK's VammManager: sdk) ----
+ # Three observation gates, found by the SDK's own symbols in any build, let the host keep the table of address regions (hle_svc.c "Address regions"): the alias region space each takes,
+@@ -1133,7 +1148,7 @@ def stdalloc_gates():
+         out.append((off, OBS_STDALLOC_INIT, f'{struct.unpack_from("<I", IMG, off)[0]:08x}', f'StandardAllocator::Initialize(void *, size_t{", bool" if name.endswith("b") else ""}) entry: the size in x2, capped when the address in x1 is null'))
+     return out
+ region_obs += stdalloc_gates()
+-for off, oid, ow, why in region_obs: put_branch(off, site_obs(off, oid, int(ow, 16))); stat('obs')
++for off, oid, ow, why in region_obs: use_area(off); put_branch(off, site_obs(off, oid, int(ow, 16))); stat('obs')
+ obs += region_obs
+ 
+ # ---- Frame step in whole vsyncs (the mains whose patch file has FRAME_STEP: The Legend of Zelda: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0, Hyrule Warriors: Age of Calamity 1.3.0,
+@@ -1169,7 +1184,7 @@ if BUILD_ID in FRAME_STEP and NAME == 'main':
+         cuts.append((off, old.hex(), bytes(IMG[off:off + 4 * len(words)]).hex(), why)); stat('frame_step')
+ if FS_STATE_OFF:   # the build's stubs (FRAME_STEP of its patches.py)
+     fs = types.SimpleNamespace(here=here, emit=emit, site=fs_site, put=fs_put, state=FS_STATE_OFF, render_scale=0)
+-    FRAME_STEP[BUILD_ID](fs); RENDER_SCALE = fs.render_scale
++    use_area(0); FRAME_STEP[BUILD_ID](fs); RENDER_SCALE = fs.render_scale
+ 
+ # ---- Spin waits (every module) ----
+ # A guest loop that polls memory until another thread changes it fills only its own core on the Switch, where any higher-priority thread pinned there preempts it, so the
+@@ -1410,7 +1425,7 @@ def spin_region1(T, bes, ban, stores):
+     return {'T': T, 'R': sorted(R), 'nodes': nodes, 'valid': valid}
+ def spin_emit(g):
+     T, R, nodes, valid = g['T'], g['R'], g['nodes'], g['valid']
+-    cpy, fixes, tramp = {}, [], {}
++    use_area(T); cpy, fixes, tramp = {}, [], {}
+     for i, a in enumerate(R):
+         n = nodes[a]; cpy[a] = here(); x = n['ins'][0]
+         if n['kind'] == 'rmw':
+@@ -1438,7 +1453,7 @@ def spin_emit(g):
+         if t not in tramp: tramp[t] = here(); emit(B(here(), t))
+         return tramp[t]
+     for idx, x, info in fixes:
+-        pc = PATCH_OFF + idx
++        pc = AREA_OFF + idx
+         if x is None: w = B(pc, cpy.get(info, info))
+         elif isinstance(info, tuple): w = spin_rebranch(x, pc, out(info[1]))
+         elif info is not None: w = spin_rebranch(x, pc, cpy[info])
+@@ -1460,13 +1475,18 @@ if os.environ.get('DM_SPIN_LIST'):
+ 
+ os.makedirs(outdir, exist_ok=True)
+ P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
+-if FAR:   # patch area before the base: file = text + ro + data (padded to 16K) + patch area
+-    if BIG_TEXT and len(patch) > FRONT - 0x4000 and 'DM_PATCH_FRONT' not in os.environ:
++patch = patch1   # from here on the front (or only) area; the back one is patch2
++if FAR:   # patch area before the base: file = text + ro + data (padded to 16K) + patch area (HUGE: padded to PATCH_LEN, then the back area)
++    if (BIG_TEXT or HUGE) and len(patch) > FRONT - 0x4000 and 'DM_PATCH_FRONT' not in os.environ:
+         need = (len(patch) + 0x4000 + 0xFFFF) & ~0xFFFF
+         print(f'{NAME}: patch area of {len(patch):#x} bytes does not fit in {FRONT:#x} before the base; rewriting again with {need:#x}', flush=True)
+         os.execve(sys.executable, [sys.executable] + sys.argv, dict(os.environ, DM_PATCH_FRONT=hex(need)))
+     assert len(patch) <= FRONT - 0x4000, f'patch area of {len(patch):#x} bytes does not fit in the {FRONT:#x} before the base'
+-    open(P('patched.bin'), 'wb').write(IMG + bytearray(FILE_IMAGE_LEN - len(IMG)) + patch)
++    if HUGE:
++        PATCH_LEN, PATCH2_LEN = (len(patch1) + 0x3FFF) & ~0x3FFF, (len(patch2) + 0x3FFF) & ~0x3FFF
++        IMAGE_SIZE = max(IMAGE_SIZE, PATCH2_OFF + PATCH2_LEN)
++        open(P('patched.bin'), 'wb').write(IMG + bytearray(FILE_IMAGE_LEN - len(IMG)) + patch1 + bytearray(PATCH_LEN - len(patch1)) + patch2)
++    else: open(P('patched.bin'), 'wb').write(IMG + bytearray(FILE_IMAGE_LEN - len(IMG)) + patch)
+ else:
+     open(P('patched.bin'), 'wb').write(IMG + bytearray(PATCH_OFF - len(IMG)) + patch)
+ import hashlib
+@@ -1474,7 +1494,8 @@ with open(os.path.join(outdir, 'build_src.sha256'), 'w') as f:   # the same for
+     for src_ in (os.path.abspath(__file__), nso.__file__, nso_code.__file__, nso_asm.__file__, *PATCH_FILES): f.write(hashlib.sha256(open(src_, 'rb').read()).hexdigest() + f'  {os.path.relpath(os.path.abspath(src_), os.path.dirname(os.path.abspath(__file__)))}\n')
+ with open(P('fixups.tsv'), 'w') as f:
+     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
+-    if FAR: f.write(f'# IMAGE_SIZE\t{IMAGE_SIZE:#x}\n# FILE_IMAGE_LEN\t{FILE_IMAGE_LEN:#x}\n')   # patch area before the base (negative PATCH_OFF): whole image size, length of the image part of the file
++    if FAR: f.write(f'# IMAGE_SIZE\t{IMAGE_SIZE:#x}\n# FILE_IMAGE_LEN\t{FILE_IMAGE_LEN:#x}\n')
++    if HUGE: f.write(f'# PATCH_LEN\t{PATCH_LEN:#x}\n# PATCH2_OFF\t{PATCH2_OFF:#x}\n# PATCH2_LEN\t{PATCH2_LEN:#x}\n')   # the back patch area: the front one's padded length, then where the back one sits and its length   # patch area before the base (negative PATCH_OFF): whole image size, length of the image part of the file
+     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
+     if FS_STATE_OFF: f.write(f'# FPS_STATE_OFF\t{FS_STATE_OFF:#x}\n')   # frame step state page (FRAME_STEP): the loader writes the target fps there
+     if RENDER_SCALE: f.write('# RENDER_SCALE\t1\n')   # a render-scale stub reads state +0x10 (the loader ignores the key; dm/games/settings.py offers the setting by it)
+@@ -1498,5 +1519,5 @@ with open(P('cuts.tsv'), 'w') as f:
+ with open(P('obs.tsv'), 'w') as f:
+     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
+     for off, oid, ow, why in obs: f.write(f'{off:#x}\t{oid}\t{ow}\t{why}\n')
+-print(NAME, stats, 'cuts', len(cuts), 'obs', len(obs), 'patch', len(patch), 'PATCH_OFF', hex(PATCH_OFF), 'slot_refs', len(fix), 'gates', len(gates))
++print(NAME, stats, 'cuts', len(cuts), 'obs', len(obs), 'patch', len(patch), 'PATCH_OFF', hex(PATCH_OFF), *(('back patch', len(patch2), 'PATCH2_OFF', hex(PATCH2_OFF), 'SPLIT', hex(SPLIT)) if HUGE else ()), 'slot_refs', len(fix), 'gates', len(gates))
+ if DATA_BLOCKS: print(NAME, 'data blocks left alone:', ', '.join(f'{s:#x}..{e:#x}' for s, e in DATA_BLOCKS))

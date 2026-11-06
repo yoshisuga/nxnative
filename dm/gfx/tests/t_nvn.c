@@ -74,21 +74,8 @@ int main(void) {
       _Alignas(8) uint8_t state[64]={0};float cap=60;memcpy(state,&cap,4);dm_fps_state=state;
       EXPECT("stub state takes precedence over env",60,fps_present_cap());
       *(uint32_t *)(state+4)=1;
-      EXPECT("the state page's movie flag is the host's copy, not read for the cap",60,fps_present_cap());
+      EXPECT("stub movie flag retains 30 cap",30,fps_present_cap());
       dm_fps_state=NULL;unsetenv("DM_FPS_TARGET");g_present_cap=-1;nvn_present_config(0,0);
-    }
-    // No frame step page and no engine limiter the host writes (a main the profile's
-    // stubs or limiter rows do not know): nothing makes the game follow the cap, so
-    // presentation keeps the game's own interval (Tears of the Kingdom 1.4.2 at 2x).
-    { win_t w={.interval=2};nvn_present_config(60,0);dm_fps_state=NULL;g_engine_stub=0;
-      setenv("DM_FPS_TARGET","60",1);g_present_cap=-1;
-      EXPECT("no limiter: the 60 cap is not applied",0,fps_present_cap());
-      EXPECT("no limiter: the game's present interval stays",2,present_itv(&w));
-      setenv("DM_FPS_TARGET","30",1);g_present_cap=-1;w.interval=1;
-      EXPECT("no limiter: the 30 cap is not applied",1,present_itv(&w));
-      _Alignas(8) uint8_t state[64]={0};float cap=60;memcpy(state,&cap,4);dm_fps_state=state;
-      EXPECT("a frame step page needs no limiter",60,fps_present_cap());
-      dm_fps_state=NULL;unsetenv("DM_FPS_TARGET");g_present_cap=-1;g_engine_stub=1;nvn_present_config(0,0);
     }
     crash_install();   // the same SIGSEGV / SIGBUS handling as production (the page-fault hook is dispatched from within it)
     // 1. Bootstrap address lookup: bootstrap gets GetProcAddress, then uses it to get all the names
@@ -133,57 +120,6 @@ int main(void) {
     P(nvnMemoryPoolBuilderSetStorage)(&pb, poolmem, sizeof poolmem); P(nvnMemoryPoolBuilderSetFlags)(&pb, 0x24);
     EXPECT("MemoryPoolInitialize succeeds", 1, P(nvnMemoryPoolInitialize)(&pool, &pb));
     EXPECT("pool GPU address = storage address", (long long)(uintptr_t)poolmem, P(nvnMemoryPoolGetBufferAddress)(&pool));
-
-    // Engines may retarget a ring buffer with raw stores instead of SetStorage.
-    // These SDK offsets come from the guest writes reported in issue #723;
-    // deliberately do not use buf_t or its offsets to construct the writes.
-    {
-        NVNbufferBuilder bb = {0};
-        struct { uint64_t before; NVNbuffer buffer; uint64_t after; } guarded = {
-            .before = UINT64_C(0x1122334455667788), .after = UINT64_C(0x8877665544332211)
-        };
-        NVNbuffer *buffer = &guarded.buffer;
-        P(nvnBufferBuilderSetDevice)(&bb, &dev); P(nvnBufferBuilderSetDefaults)(&bb);
-        P(nvnBufferBuilderSetStorage)(&bb, &pool, 0x100, 0x200);
-        EXPECT("ring buffer initializes", 1, P(nvnBufferInitialize)(buffer, &bb));
-        EXPECT("initial buffer address", (uintptr_t)poolmem + 0x100, P(nvnBufferGetAddress)(buffer));
-        EXPECT("initial buffer size", 0x200, P(nvnBufferGetSize)(buffer));
-        uint64_t initial_offset, initial_size;
-        memcpy(&initial_offset, (uint8_t *)buffer + 0x18, 8);
-        memcpy(&initial_size, (uint8_t *)buffer + 0x20, 8);
-        EXPECT("initialized guest offset field", 0x100, initial_offset);
-        EXPECT("initialized guest size field", 0x200, initial_size);
-        const struct { uint64_t offset, size; } allocations[] = {{0x4000, 0x100}, {0x8000, 0x300}, {0, 0}};
-        for (unsigned i = 0; i < sizeof allocations / sizeof allocations[0]; i++) {
-            memcpy((uint8_t *)buffer + 0x18, &allocations[i].offset, 8);
-            memcpy((uint8_t *)buffer + 0x20, &allocations[i].size, 8);
-            EXPECT("guest ring store changes address", (uintptr_t)poolmem + allocations[i].offset, P(nvnBufferGetAddress)(buffer));
-            EXPECT("guest ring store changes map", (uintptr_t)poolmem + allocations[i].offset, (uintptr_t)P(nvnBufferMap)(buffer));
-            EXPECT("guest ring store changes offset", allocations[i].offset, P(nvnBufferGetMemoryOffset)(buffer));
-            EXPECT("guest ring store changes size", allocations[i].size, P(nvnBufferGetSize)(buffer));
-            EXPECT("guest ring store preserves pool", (uintptr_t)&pool, (uintptr_t)P(nvnBufferGetMemoryPool)(buffer));
-        }
-        EXPECT("ring stores preserve builder offset", 0x100, P(nvnBufferBuilderGetMemoryOffset)(&bb));
-        EXPECT("ring stores preserve builder size", 0x200, P(nvnBufferBuilderGetSize)(&bb));
-        P(nvnBufferFinalize)(buffer);
-        EXPECT("buffer leaves preceding object intact", UINT64_C(0x1122334455667788), guarded.before);
-        EXPECT("buffer leaves following object intact", UINT64_C(0x8877665544332211), guarded.after);
-
-        static uint8_t private_mem[4096] __attribute__((aligned(4096)));
-        NVNmemoryPoolBuilder private_pb = {0}; NVNmemoryPool private_pool;
-        P(nvnMemoryPoolBuilderSetDevice)(&private_pb, &dev); P(nvnMemoryPoolBuilderSetDefaults)(&private_pb);
-        P(nvnMemoryPoolBuilderSetStorage)(&private_pb, private_mem, sizeof private_mem);
-        P(nvnMemoryPoolBuilderSetFlags)(&private_pb, NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_GPU_CACHED);
-        EXPECT("GPU-only pool initializes", 1, P(nvnMemoryPoolInitialize)(&private_pool, &private_pb));
-        P(nvnBufferBuilderSetStorage)(&bb, &private_pool, 0x100, 0x200);
-        EXPECT("GPU-only buffer initializes", 1, P(nvnBufferInitialize)(buffer, &bb));
-        uint64_t offset = 0x400, size = 0x80;
-        memcpy((uint8_t *)buffer + 0x18, &offset, 8); memcpy((uint8_t *)buffer + 0x20, &size, 8);
-        EXPECT("GPU-only retargeted address", (uintptr_t)private_mem + 0x400, P(nvnBufferGetAddress)(buffer));
-        EXPECT("GPU-only retargeted size", 0x80, P(nvnBufferGetSize)(buffer));
-        EXPECT("GPU-only buffer stays unmappable", 0, (uintptr_t)P(nvnBufferMap)(buffer));
-        P(nvnBufferFinalize)(buffer); P(nvnMemoryPoolFinalize)(&private_pool);
-    }
 
     // 4. Texture storage size (block-linear: GOB = 64 B × 8 rows; block height from the GOB count of "height × 1.5": ≥16→16, ≥8→8 ...)
     //    256×256 RGBA8: 1024 B per row = 16 GOBs; height 256 rows = 32 GOB rows, block height 16 GOBs → 2 blocks; 16×2×(512×16) = 262144
@@ -325,21 +261,10 @@ int main(void) {
         static uint8_t m[4096] __attribute__((aligned(4096))); NVNmemoryPoolBuilder mb; NVNmemoryPool mp; NVNcommandBuffer c2;
         P(nvnMemoryPoolBuilderSetDefaults)(&mb); P(nvnMemoryPoolBuilderSetStorage)(&mb, m, sizeof m); P(nvnMemoryPoolInitialize)(&mp, &mb);
         P(nvnCommandBufferInitialize)(&c2, &dev);
-        // Control memory is unused by the host's command stream: a supplied
-        // block has its full size available, even after recording commands.
-        static uint8_t ctl[512];
-        EXPECT("control free before AddControlMemory", 0, P(nvnCommandBufferGetControlMemoryFree)(&c2));
-        P(nvnCommandBufferAddControlMemory)(&c2, ctl, sizeof ctl);
-        EXPECT("control block size after grant", sizeof ctl, P(nvnCommandBufferGetControlMemorySize)(&c2));
-        EXPECT("control block free after grant", sizeof ctl, P(nvnCommandBufferGetControlMemoryFree)(&c2));
         P(nvnCommandBufferAddCommandMemory)(&c2, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&c2);
         P(nvnCommandBufferDrawElementsBaseVertex)(&c2, NVN_DRAW_PRIMITIVE_TRIANGLES, NVN_INDEX_TYPE_UNSIGNED_SHORT, 36, 0x10000, 5);
         NVNcommandHandle hd = P(nvnCommandBufferEndRecording)(&c2);
         EXPECT("plain indexed draw recording: 0x28 + END", 0x30, P(nvnCommandBufferGetCommandMemoryUsed)(&c2));
-        EXPECT("recording uses no control memory", 0, P(nvnCommandBufferGetControlMemoryUsed)(&c2));
-        EXPECT("control capacity remains available", sizeof ctl, P(nvnCommandBufferGetControlMemoryFree)(&c2));
-        P(nvnCommandBufferAddControlMemory)(&c2, ctl, 128);
-        EXPECT("new control block replaces capacity", 128, P(nvnCommandBufferGetControlMemoryFree)(&c2));
         op_hdr rh; memcpy(&rh, m, sizeof rh); p_draw_idx dt; const p_draw_idx *d = draw_idx_rec(m + 8, rh.size, &dt);
         EXPECT("its handle is the draw record", 1, (const uint8_t *)hd == m && rh.op == OP_DRAW_IDX);
         EXPECT("draw read back: count, base vertex, no indirect address", 1, d->count == 36 && d->base_vertex == 5 && d->ibuf == 0x10000 && !d->ind && !d->mdi_cnt);
@@ -634,33 +559,6 @@ int main(void) {
         bad = 0; for (int y = 0; y < 5; y++) for (int x = 0; x < 9; x++) for (int c = 0; c < 4; c++) bad += g2[(y * 9 + x) * 4 + c] != PX(x + 3, y + 2, c);
         EXPECT("ReadTexels packaged texture 9x5 (block-linear pool memory read directly)", 0, bad);
         P(nvnMemoryPoolFinalize)(&rp);
-    }
-
-    // 6b2. MINIMAL_LAYOUT storage: two 320x320 two-byte textures back to back, as before the mesh data in Tears of the Kingdom's Depths (GitHub issue #183). Each takes 204,800 bytes;
-    // WriteTexels of the first must leave the second, and the bytes after both, alone
-    {
-        enum { bytes = 320 * 320 * 2, guard = 65536 };
-        static uint8_t ms[2 * bytes + guard] __attribute__((aligned(16384)));
-        static uint8_t px[bytes], back[bytes];
-        memset(ms, 0xa7, sizeof ms);
-        for (int i = 0; i < bytes; i++) px[i] = (uint8_t)(i * 19 + (i >> 8));
-        NVNmemoryPoolBuilder mpb; NVNmemoryPool mp; P(nvnMemoryPoolBuilderSetDefaults)(&mpb); P(nvnMemoryPoolBuilderSetStorage)(&mpb, ms, sizeof ms);
-        P(nvnMemoryPoolInitialize)(&mp, &mpb);
-        NVNtexture mt[2]; NVNtextureBuilder b;
-        for (int k = 0; k < 2; k++) {
-            P(nvnTextureBuilderSetDevice)(&b, &dev); P(nvnTextureBuilderSetDefaults)(&b);
-            P(nvnTextureBuilderSetSize2D)(&b, 320, 320); P(nvnTextureBuilderSetFlags)(&b, NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT);
-            P(nvnTextureBuilderSetFormat)(&b, k ? NVN_FORMAT_RGB565 : NVN_FORMAT_RGB5A1);
-            P(nvnTextureBuilderSetStorage)(&b, &mp, k * bytes); P(nvnTextureInitialize)(&mt[k], &b);
-            EXPECT("MINIMAL_LAYOUT 320x320 two-byte texture takes 204,800 bytes", bytes, P(nvnTextureGetStorageSize)(&mt[k]));
-            NVNcopyRegion all = {0, 0, 0, 320, 320, 1};
-            P(nvnTextureWriteTexels)(&mt[k], NULL, &all, px);
-            int bad = 0; for (int i = (k + 1) * bytes; i < (int)sizeof ms; i++) bad += ms[i] != 0xa7;
-            EXPECT("MINIMAL_LAYOUT WriteTexels leaves the storage after the texture alone", 0, bad);
-            P(nvnTextureReadTexels)(&mt[k], NULL, &all, back);
-            EXPECT("MINIMAL_LAYOUT texels read back as written", 0, memcmp(px, back, bytes));
-        }
-        P(nvnTextureFinalize)(&mt[0]); P(nvnTextureFinalize)(&mt[1]); P(nvnMemoryPoolFinalize)(&mp);
     }
 
     // 6c. Write-protected dirty pages: after a packaged texture is uploaded its pool pages are read-only; game write → page fault → mark dirty → re-upload on next use; a direct host read() write needs prepare first
